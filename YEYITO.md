@@ -16,6 +16,16 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
   scroll glides into place instead of jumping. Also `drawscreen.c`: a page
   back (CTRL-B) region-scrolls like a page forward does, so it glides too.
   See [Smooth scrolling](#smooth-scrolling).
+- **Floats only block scrolls they overlap** (C, `ui_compositor.c`): a
+  region scroll used to be dropped for a full repaint whenever any float was
+  on screen; now only when one overlaps the scrolled area (upstream's TODO).
+  Always-present floats (ui2's command line, the sidebar's foot) would
+  otherwise disable smooth scrolling and make every scroll a repaint.
+- **ui2 left offset** (Lua, `runtime/lua/vim/_core/ui2.lua`, `ui2/messages.lua`):
+  `require('vim._core.ui2').set_col(n)` keeps the command line, messages,
+  pager and dialogs right of the first `n` columns, so the file sidebar can run
+  the full height. `vim._core.ui2` is compiled into the binary: rebuild after
+  editing it.
 - **Bundled parsers**: python cpp java bash javascript typescript tsx html css
   rust, besides upstream's c lua vim vimdoc query markdown
   (`cmake.deps/deps.txt`, pinned to nvim-treesitter's lockfile).
@@ -117,7 +127,9 @@ fake st on a PTY and checks each frame's bytes. In a real st,
 ## File sidebar (Ctrl+S)
 
 The Exocortex sidebar, for files: the working directory as a tree on the
-left, 28 columns with its border, in Exocortex's colors.
+left, 28 columns with its border, in Exocortex's colors. It runs the full
+height of the screen; the editor's command line, messages, `:messages` pager
+and prompts stay to its right (see [Command line and messages](#command-line-and-messages)).
 
 - **Ctrl+S** (normal, visual and insert mode): open it focused, on the current
   file (its folders opened), or close it back to the editor.
@@ -132,6 +144,24 @@ left, 28 columns with its border, in Exocortex's colors.
 - The editor's current file is bold. `:q` in the last editor window quits
   rather than leaving the sidebar alone.
 
+Like Exocortex's sidebar it has its own command line, in its bottom row
+(beside the editor's):
+
+- **`/`** and **`?`** search the whole project, forward and backward: the list
+  is filtered, live as you type, to the files and folders whose name contains
+  the text (case-insensitive; the project-relative path when it has a `/`),
+  matches highlighted, the nearest match selected. Enter keeps the filter
+  (shown as `/text` in the bottom row), Esc or Backspace on an empty bar goes
+  back. In a git repository it searches what git sees (tracked and untracked,
+  not ignored); elsewhere every folder but `.git`.
+- **`n`** / **`N`**: next / previous match (shows the filter again after
+  `:noh`).
+- Enter on a file opens it; on a folder it leaves the search and opens the
+  folder in the tree.
+- **`:`** is the sidebar's command line: `:noh` clears the filter and shows
+  the selection in the tree; anything else runs as an Ex command in the editor
+  (`:w`, `:e file`, `:q`), focus staying in the sidebar.
+
 Scrolling the sidebar jumps rather than glides. It is a feature flag,
 `g:yeyito_sidebar_smooth_scroll` (off; read on every scroll, so `:let
 g:yeyito_sidebar_smooth_scroll = v:true` turns it on right away, or set it in
@@ -143,7 +173,26 @@ commit-message and scratch editor). Ctrl+S in insert mode replaces 0.12's
 default LSP signature help there.
 
 Tests: `VIMRUNTIME=runtime build/bin/nvim --headless -u NORC -c 'luafile
-test/yeyito/test_sidebar.lua'`.
+test/yeyito/test_sidebar.lua'` (behavior and search) and `python3
+test/yeyito/test_sidebar_layout.py` (the real TUI on a fake st: full height,
+command line and pager beside it).
+
+## Command line and messages
+
+The command line and messages are ui2 (`vim._core.ui2`, upstream's
+experimental replacement of the message grid, drawn in windows), which is what
+lets them sit beside the sidebar. Differences from the classic command line:
+
+- No "Press ENTER" prompts: a message longer than the command line expands it
+  until the next key; when it doesn't fit, `[+N]` says how many lines are
+  hidden. Enter right after it, or `g<` any time, shows it all in the pager.
+- `:messages` (and long command output) opens in a pager window: scroll it,
+  `q` closes it.
+- Prompts (`:s///c`, confirm dialogs) appear in a dialog window above the
+  command line.
+
+`g:yeyito_ui2 = v:false` in `~/.config/nvim/init.lua` goes back to the classic
+command line (the sidebar then ends above it, as before).
 
 ## Markdown links
 
