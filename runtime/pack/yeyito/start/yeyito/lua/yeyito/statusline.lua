@@ -39,22 +39,37 @@ local fg_sources = {
   StlDiagHint = { "DiagnosticHint" },
 }
 
+-- Groups are defined the way lualine did: nocombine (so StatusLine's own
+-- attributes, e.g. reverse in 256-color mode, don't leak in) and lualine's
+-- own 256-color conversion.
+local to_cterm = require("yeyito.lualine_cterm")
+local function stl_hl(name, fg, bg, bold)
+  api.nvim_set_hl(0, name, {
+    fg = fg,
+    bg = bg,
+    bold = bold,
+    nocombine = true,
+    ctermfg = to_cterm(fg),
+    ctermbg = to_cterm(bg),
+    cterm = { bold = bold, nocombine = true },
+  })
+end
+
 local function highlights()
   local c = colors.palette
-  local set_hl = colors.set_hl
   local mode_colors = { normal = c.cyan, insert = c.teal, visual = c.purple, replace = c.red, command = c.yellow }
   for kind, color in pairs(mode_colors) do
-    set_hl(0, "StlMode_" .. kind, { fg = c.bg, bg = color, bold = true })
-    set_hl(0, "StlSep_" .. kind, { fg = color, bg = c.bg })
+    stl_hl("StlMode_" .. kind, c.bg, color, true)
+    stl_hl("StlSep_" .. kind, color, c.bg)
   end
-  set_hl(0, "StlB", { fg = c.cyan, bg = c.bg })
-  set_hl(0, "StlC", { fg = c.fg, bg = c.bg })
-  set_hl(0, "StlInactive", { fg = c.gray, bg = c.bg })
+  stl_hl("StlB", c.cyan, c.bg)
+  stl_hl("StlC", c.fg, c.bg)
+  stl_hl("StlInactive", c.gray, c.bg)
   for name, groups in pairs(fg_sources) do
     for _, group in ipairs(groups) do
       local fg = api.nvim_get_hl(0, { name = group, link = false }).fg
       if fg then
-        set_hl(0, name, { fg = string.format("#%06x", fg), bg = c.bg })
+        stl_hl(name, string.format("#%06x", fg), c.bg)
         break
       end
     end
