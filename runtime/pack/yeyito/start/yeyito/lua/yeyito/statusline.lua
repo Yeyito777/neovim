@@ -88,6 +88,10 @@ local function read_branch(root)
     end
     gitdir = line:sub(1, 1) == "/" and line or root .. "/" .. line
   end
+  -- A .git that isn't a repository (yet): no branch.
+  if vim.fn.filereadable(gitdir .. "/HEAD") == 0 then
+    return ""
+  end
   local head = vim.fn.readfile(gitdir .. "/HEAD", "", 1)[1]
   if not head then
     return ""
