@@ -1,0 +1,29 @@
+cmake_minimum_required(VERSION 3.16)
+project(${PARSERLANG} C)
+
+add_compile_options(-w)
+set(CMAKE_C_STANDARD 11)
+
+add_library(typescript MODULE
+typescript/src/parser.c
+typescript/src/scanner.c)
+target_include_directories(typescript
+  PRIVATE
+  typescript/src)
+
+add_library(tsx MODULE
+tsx/src/parser.c
+tsx/src/scanner.c)
+target_include_directories(tsx
+  PRIVATE
+  tsx/src)
+
+set_target_properties(
+  typescript tsx
+  PROPERTIES
+    PREFIX ""
+)
+
+install(TARGETS typescript tsx LIBRARY DESTINATION lib/nvim/parser)
+
+# vim: set ft=cmake:

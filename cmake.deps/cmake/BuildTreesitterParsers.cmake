@@ -32,3 +32,9 @@ foreach(lang c lua vim vimdoc query)
   BuildTSParser(LANG ${lang})
 endforeach()
 BuildTSParser(LANG markdown CMAKE_FILE MarkdownParserCMakeLists.txt)
+
+# Extra parsers bundled by this fork, so no plugin has to compile them.
+foreach(lang python cpp java bash javascript html css rust)
+  BuildTSParser(LANG ${lang} CMAKE_FILE ExtraParserCMakeLists.txt)
+endforeach()
+BuildTSParser(LANG typescript CMAKE_FILE TypescriptParserCMakeLists.txt)
