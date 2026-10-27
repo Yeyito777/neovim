@@ -1,6 +1,19 @@
 local M = {}
 
+-- Feature flags. Set one in ~/.config/nvim/init.lua (runs first) or at any
+-- time with :let g:NAME = v:true; each is read when it applies.
+local flags = {
+  -- The Ctrl+S file sidebar glides when it scrolls, like the editor does.
+  yeyito_sidebar_smooth_scroll = false,
+}
+
 function M.setup()
+  for name, default in pairs(flags) do
+    if vim.g[name] == nil then
+      vim.g[name] = default
+    end
+  end
+
   vim.g.mapleader = " "
   vim.g.maplocalleader = " "
 

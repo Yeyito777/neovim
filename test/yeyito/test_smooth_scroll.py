@@ -30,7 +30,7 @@ SNAP = b"\x1b]2032;o;0\x1b\\"
 
 
 class Term:
-    def __init__(self, files, smooth=True, term="st-256color", cmds=()):
+    def __init__(self, files, smooth=True, term="st-256color", cmds=(), cwd=None):
         self.smooth = smooth
         self.tmp = tempfile.mkdtemp(prefix="nvim-smooth-")
         env = dict(os.environ)
@@ -51,7 +51,7 @@ class Term:
         for cmd in cmds:
             argv += ["-c", cmd]
         self.proc = subprocess.Popen(argv + list(files), stdin=slave, stdout=slave,
-                                     stderr=slave, env=env, cwd=self.tmp, start_new_session=True)
+                                     stderr=slave, env=env, cwd=cwd or self.tmp, start_new_session=True)
         os.close(slave)
         self.fd = master
         self.log = bytearray()
@@ -177,6 +177,26 @@ def main():
     finally:
         t.close()
     check("turns mode 2032 off on exit", b"\x1b[?2032l" in t.log)
+
+    # The file sidebar glides only with g:yeyito_sidebar_smooth_scroll.
+    project = tempfile.mkdtemp(prefix="nvim-smooth-project-")
+    for i in range(80):
+        open(os.path.join(project, "file%02d.txt" % i), "w").close()
+    t = Term([path], cwd=project)
+    try:
+        t.read(1.0)
+        t.keys(b"\x13")  # CTRL-S
+        out = t.keys(b"gg") + t.keys(b"\x05")
+        check("sidebar does not glide by default", glides(out) == [] and b"file" in out, repr(out[-300:]))
+        t.keys(b":let g:yeyito_sidebar_smooth_scroll = v:true\r")
+        check("sidebar glides with the flag on", glides(t.keys(b"\x05")) == [1000])
+        t.keys(b":let g:yeyito_sidebar_smooth_scroll = v:false\r")
+        check("flag off again: sidebar jumps", glides(t.keys(b"\x05")) == [])
+        t.keys(b"\t")  # to the editor
+        check("editor beside the sidebar still glides", glides(t.keys(b"gg\x05")) == [1000])
+        check("marker never reaches the terminal (sidebar)", b"nvim-glide" not in t.log)
+    finally:
+        t.close()
 
     t = Term([path], smooth=False)
     try:

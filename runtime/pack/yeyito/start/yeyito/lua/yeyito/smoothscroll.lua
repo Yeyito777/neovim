@@ -10,7 +10,8 @@
 -- so only scrolling glides: lines that move because of an edit (dd, o, a
 -- paste) never do. Every way of scrolling glides (wheel, CTRL-E/Y/D/U/F/B,
 -- j/k at the edge, zz/zt/zb, n/N and other jumps within a screen); jumps
--- further than a screen (gg, G) are drawn in place.
+-- further than a screen (gg, G) are drawn in place. The file sidebar only
+-- glides with g:yeyito_sidebar_smooth_scroll (off by default, options.lua).
 local M = {}
 
 local api = vim.api
@@ -18,6 +19,9 @@ local api = vim.api
 local function mark(win)
   if api.nvim_win_get_config(win).relative ~= "" then
     return -- floats are composited and never region-scrolled
+  end
+  if vim.bo[api.nvim_win_get_buf(win)].filetype == "yeyito-sidebar" and not vim.g.yeyito_sidebar_smooth_scroll then
+    return -- the file sidebar jumps unless g:yeyito_sidebar_smooth_scroll (options.lua)
   end
   local info = vim.fn.getwininfo(win)[1]
   if not info then

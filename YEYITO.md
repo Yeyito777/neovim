@@ -94,9 +94,11 @@ What glides: the wheel and trackpad, CTRL-E/Y/D/U/F/B, `j`/`k` at the window
 edge, `zz`/`zt`/`zb`, `n`/`N` and other jumps within a screen, typing past the
 bottom, terminal output while following it. What doesn't: lines moving
 because of an edit (`dd`, `o`, a paste), and jumps further than a screen
-(`gg`, `G`), which are drawn in place. A window beside a split (the sidebar)
-glides too: st has no left/right margins, so its rows scroll across the whole
-width and the other windows' columns are drawn again in the same frame.
+(`gg`, `G`), which are drawn in place; nor does the file sidebar, unless
+`g:yeyito_sidebar_smooth_scroll` is on (see below). A window beside a split
+(the editor next to the sidebar) glides too: st has no left/right margins, so
+its rows scroll across the whole width and the other windows' columns are
+drawn again in the same frame.
 
 How: `smoothscroll.lua` sends the TUI a marker (`nvim_ui_send`, never written
 to the terminal) from `WinScrolled`, which fires just before the redraw. The
@@ -129,6 +131,12 @@ left, 28 columns with its border, in Exocortex's colors.
   shell or an agent show up by themselves. `.git` is hidden; dotfiles show.
 - The editor's current file is bold. `:q` in the last editor window quits
   rather than leaving the sidebar alone.
+
+Scrolling the sidebar jumps rather than glides. It is a feature flag,
+`g:yeyito_sidebar_smooth_scroll` (off; read on every scroll, so `:let
+g:yeyito_sidebar_smooth_scroll = v:true` turns it on right away, or set it in
+`~/.config/nvim/init.lua`). Feature flags and their defaults are at the top of
+`options.lua`.
 
 Unlike Exocortex it does not reopen at startup (`nvim` is also the
 commit-message and scratch editor). Ctrl+S in insert mode replaces 0.12's
