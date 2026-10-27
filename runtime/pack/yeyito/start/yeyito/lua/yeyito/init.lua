@@ -9,6 +9,7 @@ function M.setup()
   require("yeyito.treesitter").setup() -- was nvim-treesitter
   require("yeyito.textobjects").setup() -- was nvim-treesitter-textobjects
   require("yeyito.lsp").setup() -- was nvim-lspconfig
+  require("yeyito.statusline").setup() -- was lualine.nvim
   require("yeyito.completion").setup() -- was nvim-cmp + LuaSnip
   require("yeyito.markdown_refresh").setup()
   require("yeyito.persist_local_marks")
