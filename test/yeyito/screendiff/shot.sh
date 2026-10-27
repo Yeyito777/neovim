@@ -27,4 +27,5 @@ done
 sleep 0.8
 tmux -S "$sock" capture-pane -p -e -t shot > "$out"
 tmux -S "$sock" kill-server 2>/dev/null
-rm -rf "$tmp"
+sleep 0.5 # let nvim finish writing its state before removing the dirs
+rm -rf "$tmp" 2>/dev/null
