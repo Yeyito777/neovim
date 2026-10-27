@@ -1,3 +1,6 @@
+> **Yeyito's fork**: Neovim with my editor config built in, no dotfiles or plugins.
+> See [YEYITO.md](YEYITO.md). Install with `./install.sh`.
+
 <h1 align="center">
   <img src="https://raw.githubusercontent.com/neovim/neovim.github.io/master/static/logos/neovim-logo-300x87.png" alt="Neovim">
 
