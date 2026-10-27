@@ -6,6 +6,7 @@ local M = {}
 function M.setup()
   require("yeyito.colors").setup() -- color level, 'termguicolors', theme
   require("yeyito.options").setup() -- leader, options, diagnostics display
+  require("yeyito.indent_guides").setup() -- was indent-blankline.nvim
   require("yeyito.treesitter").setup() -- was nvim-treesitter
   require("yeyito.textobjects").setup() -- was nvim-treesitter-textobjects
   require("yeyito.lsp").setup() -- was nvim-lspconfig
