@@ -5,6 +5,10 @@ local M = {}
 local flags = {
   -- The Ctrl+S file sidebar glides when it scrolls, like the editor does.
   yeyito_sidebar_smooth_scroll = false,
+  -- Neovim's Lua command line and messages (ui2, experimental in 0.12): what
+  -- lets the command line sit beside the sidebar instead of under it. Off:
+  -- the classic command line and hit-enter prompts. Read at startup.
+  yeyito_ui2 = true,
 }
 
 function M.setup()

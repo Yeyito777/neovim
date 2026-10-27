@@ -6,6 +6,11 @@ local M = {}
 function M.setup()
   require("yeyito.colors").setup() -- color level, 'termguicolors', theme
   require("yeyito.options").setup() -- leader, options, diagnostics display
+  if vim.g.yeyito_ui2 then
+    -- Command line and messages drawn in windows (vim._core.ui2), so they
+    -- can stay beside the file sidebar.
+    require("vim._core.ui2").enable({})
+  end
   require("yeyito.marks").setup() -- was marks.nvim
   require("yeyito.indent_guides").setup() -- was indent-blankline.nvim
   require("yeyito.treesitter").setup() -- was nvim-treesitter

@@ -30,7 +30,7 @@ SNAP = b"\x1b]2032;o;0\x1b\\"
 
 
 class Term:
-    def __init__(self, files, smooth=True, term="st-256color", cmds=(), cwd=None):
+    def __init__(self, files, smooth=True, term="st-256color", cmds=(), cwd=None, args=()):
         self.smooth = smooth
         self.tmp = tempfile.mkdtemp(prefix="nvim-smooth-")
         env = dict(os.environ)
@@ -47,7 +47,7 @@ class Term:
         )
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-        argv = [NVIM, "-n", "-i", "NONE"]
+        argv = [NVIM, "-n", "-i", "NONE"] + list(args)
         for cmd in cmds:
             argv += ["-c", cmd]
         self.proc = subprocess.Popen(argv + list(files), stdin=slave, stdout=slave,
@@ -114,6 +114,8 @@ failures = []
 
 
 def check(name, ok, detail=""):
+    if detail and not isinstance(detail, str):
+        detail = repr(detail)
     print(("ok   " if ok else "FAIL ") + name + (("  " + detail) if detail and not ok else ""))
     if not ok:
         failures.append(name)

@@ -1,5 +1,5 @@
 -- File sidebar (Ctrl+S), headless:
---   VIMRUNTIME=runtime build/bin/nvim --headless -l test/yeyito/test_sidebar.lua
+--   VIMRUNTIME=runtime build/bin/nvim --headless -u NORC -c 'luafile test/yeyito/test_sidebar.lua'
 local api = vim.api
 local failures = 0
 local function check(name, ok, detail)
@@ -104,10 +104,136 @@ check(":q in the last editor window closes the tab with its sidebar", #api.nvim_
 
 end
 
+-- The sidebar's own command line: / ? n N :noh, Ex commands for the editor.
+-- Typing into the bar needs Nvim's main loop (feedkeys "x!" would block in
+-- its insert mode), so these steps run one after another on a timer: each
+-- queues keys, the next one checks what they did.
+local function search_steps()
+  local steps = {}
+  local function step(fn)
+    steps[#steps + 1] = fn
+  end
+  local function send(k)
+    api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "m", false)
+  end
+  local S = {}
+  local function lines()
+    return api.nvim_buf_get_lines(S.buf, 0, -1, true)
+  end
+  local function selected()
+    local row = api.nvim_win_get_cursor(S.side)[1]
+    return vim.trim(api.nvim_buf_get_lines(S.buf, row - 1, row, true)[1])
+  end
+
+  step(function()
+    local dir = vim.fs.normalize(vim.fn.tempname())
+    for _, d in ipairs({ "src/core", "docs" }) do
+      vim.fn.mkdir(dir .. "/" .. d, "p")
+    end
+    for _, f in ipairs({ "README.md", "src/main.c", "src/core/util.c", "docs/guide.md" }) do
+      vim.fn.writefile({ "x" }, dir .. "/" .. f)
+    end
+    vim.cmd("tabnew")
+    vim.cmd.cd(dir)
+    vim.cmd.edit("src/main.c")
+    S.editor = api.nvim_get_current_win()
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    send("/")
+  end)
+  step(function()
+    local bar = api.nvim_get_current_win()
+    check("/ opens the sidebar's bar", bar ~= S.side and api.nvim_win_get_config(bar).relative ~= ""
+      and api.nvim_get_mode().mode == "i", api.nvim_get_mode())
+    check("bar is in the bottom row, in the sidebar's columns",
+      api.nvim_win_get_position(bar)[1] == vim.o.lines - 1 and api.nvim_win_get_position(bar)[2] == 0
+      and api.nvim_win_get_width(bar) == 27, { api.nvim_win_get_position(bar), api.nvim_win_get_width(bar) })
+    send("ma")
+  end)
+  step(function()
+    check("typing filters the whole project live", vim.deep_equal(lines(), { "  src/main.c" }), lines())
+    send("<CR>")
+  end)
+  step(function()
+    check("Enter keeps the filter, back in the sidebar", api.nvim_get_current_win() == S.side
+      and api.nvim_get_mode().mode == "n" and vim.deep_equal(lines(), { "  src/main.c" }), { lines(), api.nvim_get_mode() })
+    send("/u<CR>")
+  end)
+  step(function()
+    check("matches in folders, dirs-first tree order", vim.deep_equal(lines(), { "  docs/guide.md", "  src/core/util.c" }), lines())
+    check("selects the next match after where it started (wrapping)", selected() == "docs/guide.md", selected())
+    send("n")
+  end)
+  step(function()
+    check("n: next match", selected() == "src/core/util.c", selected())
+    send("n")
+  end)
+  step(function()
+    check("n wraps", selected() == "docs/guide.md", selected())
+    send("N")
+  end)
+  step(function()
+    check("N: previous match", selected() == "src/core/util.c", selected())
+    send("?gui<CR>")
+  end)
+  step(function()
+    check("? searches backward", selected() == "docs/guide.md" and vim.deep_equal(lines(), { "  docs/guide.md" }), lines())
+    send("/zzz")
+  end)
+  step(function()
+    check("no matches", vim.deep_equal(lines(), { "  no matches" }), lines())
+    send("<Esc>")
+  end)
+  step(function()
+    check("Esc goes back to the last search and selection", vim.deep_equal(lines(), { "  docs/guide.md" })
+      and api.nvim_get_current_win() == S.side and api.nvim_get_mode().mode == "n", { lines(), api.nvim_get_mode() })
+    send("/<BS>")
+  end)
+  step(function()
+    check("Backspace on an empty bar closes it", api.nvim_get_current_win() == S.side and api.nvim_get_mode().mode == "n")
+    send(":noh<CR>")
+  end)
+  step(function()
+    check(":noh: the tree again, on the selection", vim.tbl_contains(lines(), "    guide.md") and selected() == "guide.md",
+      { lines(), selected() })
+    send("/core<CR>")
+  end)
+  step(function()
+    check("folders are found", vim.deep_equal(lines(), { "  📁 src/core/" }), lines())
+    send("<CR>")
+  end)
+  step(function()
+    check("Enter on a found folder opens it in the tree", selected() == "📂 core/" and vim.tbl_contains(lines(), "      util.c"),
+      { lines(), selected() })
+    send(":e README.md<CR>")
+  end)
+  step(function()
+    local name = api.nvim_buf_get_name(api.nvim_win_get_buf(S.editor))
+    check(": runs Ex commands in the editor", vim.fs.basename(name) == "README.md", name)
+    check("focus stays in the sidebar", api.nvim_get_current_win() == S.side)
+    vim.cmd("tabclose")
+  end)
+  return steps
+end
 local ok, err = pcall(run)
 if not ok then
   io.stdout:write("ERROR " .. tostring(err) .. "\n")
   failures = failures + 1
 end
-io.stdout:write(failures .. " failure(s)\n")
-vim.cmd(failures == 0 and "qa!" or "cq!")
+local steps = search_steps()
+local function next_step(i)
+  if i > #steps then
+    io.stdout:write(failures .. " failure(s)\n")
+    vim.cmd(failures == 0 and "qa!" or "cq!")
+    return
+  end
+  local step_ok, step_err = pcall(steps[i])
+  if not step_ok then
+    io.stdout:write("ERROR step " .. i .. ": " .. tostring(step_err) .. "\n")
+    failures = failures + 1
+  end
+  vim.defer_fn(function()
+    next_step(i + 1)
+  end, 150)
+end
+next_step(1)

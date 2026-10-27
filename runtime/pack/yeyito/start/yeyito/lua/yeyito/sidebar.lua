@@ -1,5 +1,7 @@
 -- File sidebar, the Exocortex TUI's sidebar for files: the working directory
--- as a tree on the left, 28 columns with its border, in the same colors.
+-- as a tree on the left, 28 columns with its border, in the same colors,
+-- running the full height of the screen (the command line and messages stay
+-- beside it, with ui2: see yeyito/init.lua).
 --   Ctrl+S   open it focused on the current file, or close it back to the editor
 --   Tab      switch focus between it and the editor while it is open
 -- In the sidebar: j/k move; Enter, l or a click opens a file in the editor
@@ -7,6 +9,14 @@
 -- closes the folder; i/a go back to the editor; q closes; R reloads. The
 -- tree follows the filesystem as files appear and go, and the editor's
 -- current file is shown bold.
+-- Like Exocortex's sidebar it has its own command line, in its bottom row:
+--   / ?      search forward/backward: the list is filtered to the files and
+--            folders of the whole project whose name matches (the path when
+--            the search has a /), live as you type; Enter keeps the filter,
+--            Esc goes back
+--   n N      next/previous match
+--   :        sidebar command: :noh clears the filter and shows the selection in
+--            the tree; anything else runs as an Ex command in the editor
 local M = {}
 
 local api, uv = vim.api, vim.uv
@@ -26,6 +36,22 @@ local rows = {} ---@type {name: string, path: string, dir: boolean, depth: integ
 local watchers = {} ---@type table<string, uv.uv_fs_event_t>
 local main_win = {} ---@type table<integer, integer> tabpage -> editor window files open in
 local saved_guicursor ---@type string?
+
+-- Search: the list is filtered to `query` while `filter` is on (until :noh).
+local search = {
+  query = "", ---@type string Last search entered with Enter.
+  direction = "forward", ---@type "forward"|"backward"
+  filter = false,
+  index = nil, ---@type table[]? Every file and folder of the project, in tree order.
+}
+-- The sidebar's own command line while it is open: { mode = "search"|"command",
+-- direction, saved = the selection it started from, win, buf }.
+local bar ---@type table?
+-- The strip below the sidebar's list (its status line and the command line
+-- rows), so the sidebar runs to the bottom of the screen.
+local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer? }
+local foot_ns = api.nvim_create_namespace("yeyito.sidebar.foot")
+local match_ns = api.nvim_create_namespace("yeyito.sidebar.match")
 
 local function sidebar_win(tab)
   for _, win in ipairs(api.nvim_tabpage_list_wins(tab or 0)) do
@@ -87,6 +113,121 @@ local function scan(dir)
   return list
 end
 
+-- Tree order (folders first, case-insensitive) for project-relative entries
+-- with `parts` (path components) and `dir`.
+local function tree_less(a, b)
+  for i = 1, math.min(#a.parts, #b.parts) do
+    local pa, pb = a.parts[i], b.parts[i]
+    if pa ~= pb then
+      local da, db = i < #a.parts or a.dir, i < #b.parts or b.dir
+      if da ~= db then
+        return da
+      end
+      local la, lb = pa:lower(), pb:lower()
+      if la ~= lb then
+        return la < lb
+      end
+      return pa < pb
+    end
+  end
+  return #a.parts < #b.parts
+end
+
+local function entry(path, dir)
+  local rel = path:sub(#root + 2)
+  local parts = vim.split(rel, "/", { plain = true })
+  return { rel = rel, name = parts[#parts], path = path, dir = dir, parts = parts, depth = 0 }
+end
+
+--- Every file and folder under the root: git's view of it (tracked and
+--- untracked, not ignored) in a repository, else a walk of the folders.
+local function build_index()
+  local list, seen = {}, {}
+  local function add(rel, dir)
+    if not seen[rel] and rel ~= "" and rel ~= "." then
+      seen[rel] = true
+      list[#list + 1] = entry(vim.fs.joinpath(root, rel), dir)
+    end
+  end
+  local ok, res = pcall(function()
+    return vim.system({ "git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard" }):wait(3000)
+  end)
+  if ok and res.code == 0 then
+    for rel in (res.stdout or ""):gmatch("[^%z]+") do
+      local dir = vim.fs.dirname(rel)
+      while dir ~= "." and dir ~= "" and not seen[dir] do
+        add(dir, true)
+        dir = vim.fs.dirname(dir)
+      end
+      add(rel, false)
+    end
+  else
+    for name, kind in vim.fs.dir(root, {
+      depth = 32,
+      skip = function(dir)
+        return vim.fs.basename(dir) ~= ".git"
+      end,
+    }) do
+      if vim.fs.basename(name) ~= ".git" then
+        add(name, kind == "directory")
+      end
+      if #list >= 50000 then
+        break
+      end
+    end
+  end
+  table.sort(list, tree_less)
+  search.index = list
+  return list
+end
+
+--- Entries matching `query`: case-insensitive, in the name, or in the
+--- project-relative path when the query has a /.
+local function matches(query)
+  local lq, by_path = query:lower(), query:find("/", 1, true)
+  local out = {}
+  for _, e in ipairs(search.index or build_index()) do
+    if (by_path and e.rel or e.name):lower():find(lq, 1, true) then
+      out[#out + 1] = e
+    end
+  end
+  return out
+end
+
+--- The match after (or before) `from` in tree order, wrapping; `from` is an
+--- entry or nil (start from the top or bottom).
+local function next_match(list, from, direction)
+  if #list == 0 then
+    return nil
+  end
+  if direction == "forward" then
+    for _, e in ipairs(list) do
+      if not from or tree_less(from, e) then
+        return e
+      end
+    end
+    return list[1]
+  end
+  for i = #list, 1, -1 do
+    if not from or tree_less(list[i], from) then
+      return list[i]
+    end
+  end
+  return list[#list]
+end
+
+--- The filter shown now: what is typed in an open search bar, else the last
+--- search until :noh.
+local function active_query()
+  if bar and bar.mode == "search" and bar.buf and api.nvim_buf_is_valid(bar.buf) then
+    local input = api.nvim_buf_get_lines(bar.buf, 0, 1, false)[1] or ""
+    if input ~= "" then
+      return input
+    end
+  end
+  return search.filter and search.query ~= "" and search.query or nil
+end
+
 local refresh
 
 -- Folders on screen are watched, so files the shell or an agent creates show up.
@@ -121,6 +262,11 @@ end
 
 local function build()
   rows = {}
+  local query = active_query()
+  if query then
+    rows = matches(query)
+    return
+  end
   local watched = { [root] = true }
   local function walk(dir, depth)
     for _, entry in ipairs(children[dir] or scan(dir)) do
@@ -160,7 +306,26 @@ local function truncate(text, width)
   return out .. "…"
 end
 
+--- Keep the end of `text` (the file name) when it is too wide.
+local function truncate_left(text, width)
+  if vim.fn.strdisplaywidth(text) <= width then
+    return text
+  end
+  local chars = vim.fn.split(text, "\\zs")
+  local out = ""
+  for i = #chars, 1, -1 do
+    if vim.fn.strdisplaywidth("…" .. chars[i] .. out) > width then
+      break
+    end
+    out = chars[i] .. out
+  end
+  return "…" .. out
+end
+
 local function label(row)
+  if row.rel then -- a search match: its path in the project
+    return (row.dir and "📁 " or "") .. truncate_left(row.rel .. (row.dir and "/" or ""), WIDTH - 3 - (row.dir and 3 or 0))
+  end
   if row.dir then
     return (expanded[row.path] and "📂 " or "📁 ") .. row.name .. "/"
   end
@@ -227,9 +392,29 @@ local function render(keep_path)
       target = i
     end
   end
+  local query = active_query()
+  if query and #rows == 0 then
+    lines = { "  no matches" }
+  end
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
+  -- Matches are highlighted like a search in the editor.
+  api.nvim_buf_clear_namespace(buf, match_ns, 0, -1)
+  if query then
+    local lq = query:lower()
+    for i, line in ipairs(lines) do
+      local from = 1
+      while rows[i] do
+        local s, e = line:lower():find(lq, from, true)
+        if not s then
+          break
+        end
+        api.nvim_buf_set_extmark(buf, match_ns, i - 1, s - 1, { end_col = e, hl_group = "YeyitoSidebarMatch", priority = 300 })
+        from = e + 1
+      end
+    end
+  end
   if win then
     vim.wo[win].winbar = header()
     if target then
@@ -261,6 +446,10 @@ end
 
 --- Expand the folders down to `path` and select it.
 local function reveal(path)
+  if active_query() then
+    render(path)
+    return
+  end
   if not (root and path and path ~= "" and vim.startswith(path, root .. "/")) then
     return
   end
@@ -270,6 +459,10 @@ local function reveal(path)
     dir = vim.fs.dirname(dir)
   end
   render(path)
+end
+
+function M.reveal(path)
+  reveal(path)
 end
 
 -- ── Actions ───────────────────────────────────────────────────────────────
@@ -300,6 +493,14 @@ local function activate()
   if not row then
     return
   end
+  if row.rel and row.dir then
+    -- A folder found by a search: leave the search, open it in the tree.
+    search.filter = false
+    expanded[row.path] = true
+    M.reveal(row.path)
+    M.update_foot()
+    return
+  end
   if row.dir then
     expanded[row.path] = not expanded[row.path] or nil
     render(row.path)
@@ -311,7 +512,7 @@ end
 local function collapse()
   local win = sidebar_win()
   local row = win and cursor_row(win)
-  if not row then
+  if not row or row.rel then
     return
   end
   if row.dir and expanded[row.path] then
@@ -324,6 +525,300 @@ local function collapse()
     expanded[parent] = nil
     render(parent)
   end
+end
+
+-- ── Below the list: foot strip and the sidebar's command line ─────────────
+
+local function ui2()
+  local mod = package.loaded["vim._core.ui2"]
+  return mod and mod.msg and mod or nil -- enabled
+end
+
+local function focused()
+  local win = api.nvim_get_current_win()
+  return win == sidebar_win() or (bar ~= nil and win == bar.win)
+end
+
+local function close_foot()
+  if foot.win and api.nvim_win_is_valid(foot.win) then
+    api.nvim_win_close(foot.win, true)
+  end
+  foot.win = nil
+end
+
+--- Cover the rows below the list (the sidebar's status line and the command
+--- line rows) in the sidebar's colors, border included, and keep the command
+--- line and messages to the right of it.
+local function update_foot()
+  local side = sidebar_win()
+  local u = ui2()
+  if u then
+    u.set_col(side and WIDTH or 0)
+  end
+  if not (side and u) then
+    close_foot()
+    return
+  end
+  local info = vim.fn.getwininfo(side)[1]
+  local top = info.winrow - 1 + info.winbar + info.height
+  local height = vim.o.lines - top
+  if height < 1 then
+    close_foot()
+    return
+  end
+  if not (foot.buf and api.nvim_buf_is_valid(foot.buf)) then
+    foot.buf = api.nvim_create_buf(false, true)
+    vim.bo[foot.buf].bufhidden = "hide"
+  end
+  local lines = {}
+  for i = 1, height do
+    lines[i] = (" "):rep(WIDTH - 1) .. "│"
+  end
+  -- The last search stays on show while the list is filtered, like the
+  -- editor's command line shows it.
+  if search.filter and search.query ~= "" and not bar then
+    local text = " " .. (search.direction == "forward" and "/" or "?") .. search.query
+    text = truncate(text, WIDTH - 2)
+    lines[height] = text .. (" "):rep(WIDTH - 1 - vim.fn.strdisplaywidth(text)) .. "│"
+  end
+  api.nvim_buf_set_lines(foot.buf, 0, -1, false, lines)
+  api.nvim_buf_clear_namespace(foot.buf, foot_ns, 0, -1)
+  local border = focused() and "YeyitoSidebarBorderFocused" or "YeyitoSidebarBorder"
+  for i, line in ipairs(lines) do
+    api.nvim_buf_set_extmark(foot.buf, foot_ns, i - 1, #line - #"│", { end_col = #line, hl_group = border })
+  end
+  local cfg = { relative = "editor", row = top, col = 0, width = WIDTH, height = height }
+  if foot.win and api.nvim_win_is_valid(foot.win) and api.nvim_win_get_tabpage(foot.win) == api.nvim_get_current_tabpage() then
+    api.nvim_win_set_config(foot.win, cfg)
+  else
+    close_foot()
+    -- zindex 200 (the message layer) is the lowest that may cover the
+    -- command line rows; ui2's windows are right of the sidebar, never under.
+    cfg.style, cfg.focusable, cfg.mouse, cfg.zindex, cfg.noautocmd = "minimal", false, false, 200, true
+    foot.win = api.nvim_open_win(foot.buf, false, cfg)
+    vim.wo[foot.win].winhighlight = "Normal:YeyitoSidebar"
+    vim.wo[foot.win].signcolumn = "no"
+  end
+end
+
+M.update_foot = function()
+  update_foot()
+end
+
+local function selected_entry()
+  local win = sidebar_win()
+  local row = win and cursor_row(win)
+  if not row then
+    return nil
+  end
+  return row.rel and row or entry(row.path, row.dir)
+end
+
+--- Close the sidebar's command line; `cancel` puts the selection back.
+local function close_bar(cancel)
+  if not bar then
+    return
+  end
+  local b = bar
+  bar = nil
+  if b.win and api.nvim_win_is_valid(b.win) then
+    api.nvim_win_close(b.win, true)
+  end
+  vim.cmd.stopinsert()
+  if b.showmode ~= nil then
+    vim.o.showmode = b.showmode
+  end
+  local side = sidebar_win()
+  if side then
+    api.nvim_set_current_win(side)
+    render(cancel and b.saved and b.saved.path or nil)
+  end
+  update_foot()
+end
+
+--- Typing in the search bar: filter to what is typed and select the nearest match.
+local function live_search()
+  if not (bar and bar.mode == "search") then
+    return
+  end
+  local input = api.nvim_buf_get_lines(bar.buf, 0, 1, false)[1] or ""
+  local target = bar.saved and bar.saved.path
+  if input ~= "" then
+    local hit = next_match(matches(input), bar.saved, bar.direction)
+    target = hit and hit.path or target
+  end
+  render(target)
+end
+
+local function run_command(cmd)
+  cmd = vim.trim(cmd)
+  if cmd == "" then
+    return
+  end
+  if cmd == "noh" or cmd == "nohl" or cmd == "nohlsearch" then
+    local sel = selected_entry()
+    search.filter = false
+    if sel then
+      reveal(sel.path)
+    else
+      render()
+    end
+    update_foot()
+    return
+  end
+  -- Anything else is an Ex command for the editor (:w, :e file, :q, ...).
+  local side, editor = sidebar_win(), editor_win()
+  if editor then
+    api.nvim_set_current_win(editor)
+  end
+  local ok, err = pcall(vim.cmd, cmd)
+  if not ok then
+    -- Just "E492: Not an editor command: ...", as the editor's : shows it.
+    err = tostring(err)
+    vim.notify(err:match("(E%d+:.*)$") or err, vim.log.levels.ERROR)
+  end
+  if side and api.nvim_win_is_valid(side) and editor and api.nvim_get_current_win() == editor then
+    api.nvim_set_current_win(side)
+  end
+end
+
+local function submit_bar()
+  if not bar then
+    return
+  end
+  local b = bar
+  local input = api.nvim_buf_get_lines(b.buf, 0, 1, false)[1] or ""
+  if b.mode == "command" then
+    close_bar(false)
+    -- After the bar's insert mode has ended: leaving it clears the command
+    -- line, which would take the command's messages with it.
+    vim.schedule(function()
+      run_command(input)
+    end)
+    return
+  end
+  if input == "" then
+    close_bar(true)
+    return
+  end
+  search.query, search.direction, search.filter = input, b.direction, true
+  local hit = next_match(matches(input), b.saved, b.direction)
+  close_bar(false)
+  render(hit and hit.path or (b.saved and b.saved.path))
+  update_foot()
+end
+
+--- Open the sidebar's command line in its bottom row: "search" (/ or ?) or "command" (:).
+function M.open_bar(mode, direction)
+  local side = sidebar_win()
+  if not side then
+    return
+  end
+  close_bar(true)
+  if mode == "search" then
+    build_index() -- the project may have changed since the last search
+  end
+  local b = api.nvim_create_buf(false, true)
+  vim.bo[b].bufhidden = "wipe"
+  bar = { mode = mode, direction = direction or search.direction, saved = selected_entry(), buf = b, showmode = vim.o.showmode }
+  local prompt = mode == "command" and ":" or (bar.direction == "forward" and "/" or "?")
+  bar.win = api.nvim_open_win(b, true, {
+    relative = "editor",
+    row = vim.o.lines - 1,
+    col = 0,
+    width = WIDTH - 1,
+    height = 1,
+    style = "minimal",
+    zindex = 201, -- over the foot, in the command line row
+    noautocmd = true,
+  })
+  vim.wo[bar.win].winhighlight = "Normal:YeyitoSidebarBar"
+  vim.wo[bar.win].wrap = false
+  vim.wo[bar.win].signcolumn = "no" -- "minimal" makes it auto: no mark signs here
+  local pns = api.nvim_create_namespace("yeyito.sidebar.prompt")
+  api.nvim_buf_set_extmark(b, pns, 0, 0, {
+    virt_text = { { prompt, "YeyitoSidebarPrompt" }, { " ", "YeyitoSidebarBar" } },
+    virt_text_pos = "inline",
+    right_gravity = false,
+  })
+  local placeholder ---@type integer?
+  local function show_placeholder()
+    local empty = (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
+    if empty and not placeholder then
+      placeholder = api.nvim_buf_set_extmark(b, pns, 0, 0, {
+        virt_text = { { mode == "command" and "command" or "search", "YeyitoSidebarPlaceholder" } },
+        virt_text_pos = "eol",
+      })
+    elseif not empty and placeholder then
+      api.nvim_buf_del_extmark(b, pns, placeholder)
+      placeholder = nil
+    end
+  end
+  show_placeholder()
+  api.nvim_buf_attach(b, false, {
+    on_lines = function()
+      vim.schedule(function()
+        if bar and bar.buf == b and api.nvim_buf_is_valid(b) then
+          show_placeholder()
+          live_search()
+        end
+      end)
+    end,
+  })
+  local function imap(lhs, rhs, opts)
+    vim.keymap.set("i", lhs, rhs, vim.tbl_extend("force", { buffer = b, nowait = true }, opts or {}))
+  end
+  imap("<CR>", submit_bar)
+  imap("<Esc>", function()
+    close_bar(true)
+  end)
+  imap("<C-c>", function()
+    close_bar(true)
+  end)
+  imap("<BS>", function()
+    if (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == "" then
+      vim.schedule(function()
+        close_bar(true)
+      end)
+      return ""
+    end
+    return "<BS>"
+  end, { expr = true })
+  imap("<Tab>", "")
+  imap("<C-s>", function()
+    close_bar(true)
+    M.close()
+  end)
+  api.nvim_create_autocmd("WinLeave", {
+    buffer = b,
+    once = true,
+    callback = function()
+      vim.schedule(function()
+        if bar and bar.buf == b then
+          close_bar(true)
+        end
+      end)
+    end,
+  })
+  -- The bar's insert mode is not the editor's: no "-- INSERT --" beside it.
+  vim.o.showmode = false
+  update_foot()
+  vim.cmd.startinsert()
+end
+
+--- n / N: the next / previous match of the last search (shows the filter again).
+function M.search_next(reverse)
+  if search.query == "" then
+    return
+  end
+  search.filter = true
+  local direction = search.direction
+  if reverse then
+    direction = direction == "forward" and "backward" or "forward"
+  end
+  local hit = next_match(matches(search.query), selected_entry(), direction)
+  render(hit and hit.path)
+  update_foot()
 end
 
 local function set_focused_look(win, focused)
@@ -380,6 +875,21 @@ local function get_buf()
   map("R", function()
     refresh()
   end, "Reload the tree")
+  map("/", function()
+    M.open_bar("search", "forward")
+  end, "Search the project, forward")
+  map("?", function()
+    M.open_bar("search", "backward")
+  end, "Search the project, backward")
+  map(":", function()
+    M.open_bar("command")
+  end, "Sidebar command (:noh), or an Ex command for the editor")
+  map("n", function()
+    M.search_next(false)
+  end, "Next match")
+  map("N", function()
+    M.search_next(true)
+  end, "Previous match")
   api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
@@ -429,10 +939,12 @@ function M.open()
   children = {}
   render()
   reveal(file)
+  update_foot()
 end
 
 --- Close it, back to the editor.
 function M.close()
+  close_bar(true)
   local win = sidebar_win()
   if not win then
     return
@@ -478,6 +990,10 @@ local function highlights()
   set(0, "YeyitoSidebarStatus", { fg = "#030814", bg = "#030814" })
   set(0, "YeyitoSidebarBorder", { fg = "#555555", bg = colors.palette.bg })
   set(0, "YeyitoSidebarBorderFocused", { fg = "#1c94e5", bg = colors.palette.bg })
+  set(0, "YeyitoSidebarMatch", { fg = colors.palette.bg, bg = "#fce094" })
+  set(0, "YeyitoSidebarBar", { fg = "#ffffff", bg = "#030814" })
+  set(0, "YeyitoSidebarPrompt", { fg = "#1d9bf0", bg = "#030814" })
+  set(0, "YeyitoSidebarPlaceholder", { fg = "#646464", bg = "#030814" })
   api.nvim_set_hl(0, "YeyitoSidebarCursor", { blend = 100, bg = "#030814", fg = "#030814" })
 end
 
@@ -497,6 +1013,7 @@ function M.setup()
       local side = sidebar_win()
       if side then
         set_focused_look(side, win == side)
+        update_foot()
       end
       if is_editor_win(win) then
         main_win[api.nvim_get_current_tabpage()] = win
@@ -532,6 +1049,7 @@ function M.setup()
     callback = function(args)
       if tonumber(args.match) == sidebar_win() then
         vim.schedule(function()
+          update_foot()
           if not sidebar_win() then
             unwatch_all()
             if saved_guicursor then
@@ -541,6 +1059,20 @@ function M.setup()
           end
         end)
       end
+    end,
+  })
+  -- The rows below the list follow the layout.
+  api.nvim_create_autocmd({ "WinResized", "VimResized", "TabEnter" }, {
+    group = group,
+    callback = function()
+      update_foot()
+    end,
+  })
+  api.nvim_create_autocmd("OptionSet", {
+    group = group,
+    pattern = { "cmdheight", "laststatus" },
+    callback = function()
+      vim.schedule(update_foot)
     end,
   })
   -- :q in the last editor window quits instead of leaving the sidebar alone.
