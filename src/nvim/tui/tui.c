@@ -33,6 +33,7 @@
 #include "nvim/os/input.h"
 #include "nvim/os/os.h"
 #include "nvim/os/os_defs.h"
+#include "nvim/os/time.h"
 #include "nvim/strings.h"
 #include "nvim/tui/input.h"
 #include "nvim/tui/terminfo.h"
@@ -59,6 +60,14 @@
    && 0 == memcmp((str), (prefix), sizeof(prefix) - 1))
 #define TMUX_WRAP(is_tmux, seq) \
   ((is_tmux) ? "\x1bPtmux;\x1b" seq "\x1b\\" : seq)
+/// Marker the server sends with nvim_ui_send() before the redraw in which a
+/// window's view scrolled: "\x1b_nvim-glide;TOP;BOT;LEFT;RIGHT\x1b\\" with
+/// the window text area in screen cells (BOT and RIGHT exclusive, like
+/// grid_scroll). It is consumed here, never written to the terminal.
+#define GLIDE_MARK "\x1b_nvim-glide;"
+#define GLIDE_MS 100      ///< glide duration, st's own smoothscroll_ms feel
+#define GLIDE_MAXARMS 4
+#define GLIDE_MAXTERMS 16
 #define LINUXSET0C "\x1b[?0c"
 #define LINUXSET1C "\x1b[?1c"
 
@@ -112,7 +121,25 @@ struct TUIData {
     bool grapheme_clusters : 1;
     bool theme_updates : 1;
     bool resize_events : 1;
+    bool app_smooth_scroll : 1;
   } modes;
+
+  // App-driven smooth scrolling (st's mode 2032, st docs/app-smooth-scroll.md):
+  // a region scroll of a window whose view moved (marked by the server, see
+  // GLIDE_MARK) is drawn from where its content was, easing into place.
+  struct {
+    bool on;  ///< the terminal supports mode 2032 and it is on
+    int narmed;
+    Rect armed[GLIDE_MAXARMS];  ///< windows whose view moved in this frame
+    bool consumed[GLIDE_MAXARMS];  ///< a region scroll drew that move
+    Rect rect;  ///< moving rectangle declared to the terminal (top < 0: none)
+    /// Easing terms the terminal is running: rows still to go at `start`.
+    struct {
+      uint64_t start;
+      int rows;
+    } term[GLIDE_MAXTERMS];
+    int nterms;
+  } glide;
 
   FILE *screenshot;
   cursorentry_T cursor_shapes[SHAPE_IDX_COUNT];
@@ -267,6 +294,16 @@ void tui_handle_term_mode(TUIData *tui, TermMode mode, TermModeState state)
     case kTermModeLeftAndRightMargins:
       tui->has_left_and_right_margin_mode = true;
       break;
+    case kTermModeAppSmoothScroll:
+      if (!is_set) {
+        tui_set_term_mode(tui, mode, true);
+        tui->modes.app_smooth_scroll = true;
+      }
+      // Start from a clean slate: no offset, rectangles or kept lines.
+      out(tui, S_LEN("\x1b]2032;c\x1b\\"));
+      glide_reset(tui);
+      tui->glide.on = true;
+      break;
     default:
       break;
     }
@@ -372,6 +409,8 @@ static void terminfo_start(TUIData *tui)
   tui->modes.grapheme_clusters = false;
   tui->modes.resize_events = false;
   tui->modes.theme_updates = false;
+  tui->modes.app_smooth_scroll = false;
+  glide_reset(tui);
   tui->showing_mode = SHAPE_IDX_N;
   tui->terminfo_ext.enable_focus_reporting = NULL;
   tui->terminfo_ext.disable_focus_reporting = NULL;
@@ -468,6 +507,7 @@ static void terminfo_start(TUIData *tui)
 
   tui->has_left_and_right_margin_mode = false;
   tui->has_sync_mode = false;
+  tui->glide.on = false;
 
   // Query support for private DEC modes that Nvim can take advantage of.
   // Some terminals (such as Terminal.app) do not support DECRQM, so skip the query.
@@ -477,6 +517,7 @@ static void terminfo_start(TUIData *tui)
     tui_request_term_mode(tui, kTermModeGraphemeClusters);
     tui_request_term_mode(tui, kTermModeThemeUpdates);
     tui_request_term_mode(tui, kTermModeResizeEvents);
+    tui_request_term_mode(tui, kTermModeAppSmoothScroll);
   }
 
   // Don't use DECRQSS in screen or tmux, as they behave strangely when receiving it.
@@ -563,6 +604,13 @@ static void terminfo_disable(TUIData *tui)
   if (tui->modes.grapheme_clusters) {
     tui_set_term_mode(tui, kTermModeGraphemeClusters, false);
   }
+
+  // Also drops any offset, rectangles and kept lines.
+  if (tui->modes.app_smooth_scroll) {
+    tui_set_term_mode(tui, kTermModeAppSmoothScroll, false);
+    tui->modes.app_smooth_scroll = false;
+  }
+  tui->glide.on = false;
 
   // May restore old title before exiting alternate screen.
   tui_set_title(tui, NULL_STRING);
@@ -1231,6 +1279,12 @@ static void reset_scroll_region(TUIData *tui, bool fullwidth)
 void tui_grid_resize(TUIData *tui, Integer g, Integer width, Integer height)
 {
   UGrid *grid = &tui->grid;
+  // The terminal drops its glide state on a resize; this may also be a resize
+  // the terminal has not seen, so clear it either way.
+  if (tui->glide.on) {
+    out(tui, S_LEN("\x1b]2032;c\x1b\\"));
+    glide_reset(tui);
+  }
   ugrid_resize(grid, (int)width, (int)height);
 
   // resize might not always be followed by a clear before flush
@@ -1254,6 +1308,7 @@ void tui_grid_resize(TUIData *tui, Integer g, Integer width, Integer height)
 void tui_grid_clear(TUIData *tui, Integer g)
 {
   UGrid *grid = &tui->grid;
+  glide_snap(tui);
   ugrid_clear(grid);
   // safe to clear cache at this point
   schar_cache_clear_if_full();
@@ -1451,6 +1506,130 @@ void tui_mode_change(TUIData *tui, String mode, Integer mode_idx)
   tui->showing_mode = (ModeShape)mode_idx;
 }
 
+/// Forget glide state: nothing moving, no rectangle declared. The terminal
+/// clears the same on a resize or screen switch.
+static void glide_reset(TUIData *tui)
+{
+  tui->glide.narmed = 0;
+  tui->glide.rect = (Rect){ -1, -1, -1, -1 };
+  tui->glide.nterms = 0;
+}
+
+static uint64_t glide_now_ms(void)
+{
+  return os_hrtime() / 1000000;
+}
+
+/// Rows the terminal's easing terms still have to go (st's cubic ease-out),
+/// dropping the finished ones.
+static double glide_remaining(TUIData *tui)
+{
+  uint64_t now = glide_now_ms();
+  double rows = 0;
+  int j = 0;
+  for (int i = 0; i < tui->glide.nterms; i++) {
+    double p = (double)(now - tui->glide.term[i].start) / GLIDE_MS;
+    if (p >= 1) {
+      continue;
+    }
+    double rest = 1 - p;
+    rows += tui->glide.term[i].rows * rest * rest * rest;
+    tui->glide.term[j++] = tui->glide.term[i];
+  }
+  tui->glide.nterms = j;
+  return rows;
+}
+
+/// Stop whatever is gliding where it is meant to end.
+static void glide_snap(TUIData *tui)
+{
+  if (tui->glide.nterms > 0) {
+    out(tui, S_LEN("\x1b]2032;o;0\x1b\\"));
+    tui->glide.nterms = 0;
+  }
+}
+
+/// Handle the server's glide marker (see GLIDE_MARK). Returns false if
+/// `content` is not one, so it is written to the terminal as usual.
+static bool glide_arm(TUIData *tui, String content)
+{
+  size_t marklen = sizeof(GLIDE_MARK) - 1;
+  if (content.size <= marklen || memcmp(content.data, GLIDE_MARK, marklen) != 0) {
+    return false;
+  }
+  char buf[64];
+  size_t len = MIN(content.size - marklen, sizeof(buf) - 1);
+  memcpy(buf, content.data + marklen, len);
+  buf[len] = NUL;
+  Rect r;
+  if (tui->glide.on && tui->glide.narmed < GLIDE_MAXARMS
+      && sscanf(buf, "%d;%d;%d;%d", &r.top, &r.bot, &r.left, &r.right) == 4) {
+    tui->glide.consumed[tui->glide.narmed] = false;
+    tui->glide.armed[tui->glide.narmed++] = r;
+  }
+  return true;
+}
+
+/// The marked window whose text area is exactly this scroll region, or -1.
+static int glide_match(TUIData *tui, int top, int bot, int left, int right)
+{
+  for (int i = 0; i < tui->glide.narmed; i++) {
+    Rect r = tui->glide.armed[i];
+    if (r.top == top && r.bot == bot && r.left == left && r.right == right) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/// After a region scroll (rows > 0: content moved up) of a marked window:
+/// draw its content where it was and let the terminal ease it into place.
+/// Rows and columns are inclusive here.
+static void glide_start(TUIData *tui, int top, int bot, int left, int right, int rows)
+{
+  double remaining = glide_remaining(tui);
+  Rect rect = { top, bot, left, right };
+  if (memcmp(&rect, &tui->glide.rect, sizeof rect) != 0) {
+    // Another window: the terminal kept lines for this region only.
+    glide_snap(tui);
+    remaining = 0;
+    out_printf(tui, 64, "\x1b]2032;r;%d,%d,%d,%d\x1b\\", top + 1, left + 1, bot + 1, right + 1);
+    tui->glide.rect = rect;
+  }
+  int height = bot - top + 1;
+  double offset = remaining + rows;
+  if ((offset < 0 ? -offset : offset) >= MAX(1, height - 1)) {
+    // Further than the lines the terminal keeps for the region: jump.
+    glide_snap(tui);
+    return;
+  }
+  out_printf(tui, 64, "\x1b]2032;m;0;%d;%d\x1b\\", rows * 1000, GLIDE_MS);
+  if (tui->glide.nterms == GLIDE_MAXTERMS) {
+    memmove(&tui->glide.term[0], &tui->glide.term[1],
+            sizeof(tui->glide.term[0]) * (GLIDE_MAXTERMS - 1));
+    tui->glide.nterms--;
+  }
+  tui->glide.term[tui->glide.nterms].start = glide_now_ms();
+  tui->glide.term[tui->glide.nterms++].rows = rows;
+}
+
+/// End of a frame: a marked window that moved without a region scroll was
+/// redrawn in place (a jump further than a screen, a horizontal scroll), so
+/// nothing may keep gliding over it.
+static void glide_end_frame(TUIData *tui)
+{
+  if (!tui->glide.on) {
+    return;
+  }
+  for (int i = 0; i < tui->glide.narmed; i++) {
+    if (!tui->glide.consumed[i]) {
+      glide_snap(tui);
+      break;
+    }
+  }
+  tui->glide.narmed = 0;
+}
+
 void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, Integer startcol,
                      Integer endcol, Integer rows, Integer cols FUNC_ATTR_UNUSED)
 {
@@ -1467,17 +1646,30 @@ void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, 
 
   bool has_lr_margins = tui->has_left_and_right_margin_mode && tui->can_set_lr_margin;
 
-  bool can_scroll = tui->can_scroll
-                    && (full_screen_scroll
-                        || (tui->can_change_scroll_region
-                            && ((left == 0 && right == tui->width - 1) || has_lr_margins)));
+  // A window whose view moved (the server marked it) glides on a terminal
+  // with app-driven smooth scrolling.
+  int armed = tui->glide.on
+              ? glide_match(tui, (int)startrow, (int)endrow, (int)startcol, (int)endcol) : -1;
+  // Beside another window on a terminal without left/right margins, its rows
+  // scroll across the whole width and the other windows' columns are drawn
+  // again, so it can glide instead of being redrawn in place.
+  bool band = armed >= 0 && !fullwidth && !has_lr_margins
+              && tui->can_scroll && tui->can_change_scroll_region;
+
+  bool can_scroll = band
+                    || (tui->can_scroll
+                        && (full_screen_scroll
+                            || (tui->can_change_scroll_region
+                                && ((left == 0 && right == tui->width - 1) || has_lr_margins))));
 
   if (can_scroll) {
+    int scroll_left = band ? 0 : left;
+    int scroll_right = band ? tui->width - 1 : right;
     // Change terminal scroll region and move cursor to the top
     if (!full_screen_scroll) {
-      set_scroll_region(tui, top, bot, left, right);
+      set_scroll_region(tui, top, bot, scroll_left, scroll_right);
     }
-    cursor_goto(tui, top, left);
+    cursor_goto(tui, top, scroll_left);
     update_attrs(tui, 0);
 
     if (rows > 0) {
@@ -1496,7 +1688,26 @@ void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, 
 
     // Restore terminal scroll region and cursor
     if (!full_screen_scroll) {
-      reset_scroll_region(tui, fullwidth);
+      reset_scroll_region(tui, fullwidth || band);
+    }
+
+    if (band) {
+      // The other windows' columns moved along with the band.
+      if (left > 0) {
+        invalidate(tui, top, bot + 1, 0, left);
+      }
+      if (right < tui->width - 1) {
+        invalidate(tui, top, bot + 1, right + 1, tui->width);
+      }
+    }
+
+    if (armed >= 0) {
+      tui->glide.consumed[armed] = true;
+      glide_start(tui, top, bot, left, right, (int)rows);
+    } else if (tui->glide.nterms > 0
+               && (top != tui->glide.rect.top || bot != tui->glide.rect.bot)) {
+      // The terminal keeps lines for one region; scrolling another drops them.
+      glide_snap(tui);
     }
   } else {
     // Mark the moved region as invalid for redrawing later
@@ -1576,6 +1787,9 @@ void tui_default_colors_set(TUIData *tui, Integer rgb_fg, Integer rgb_bg, Intege
 void tui_ui_send(TUIData *tui, String content)
   FUNC_ATTR_NONNULL_ALL
 {
+  if (glide_arm(tui, content)) {
+    return;
+  }
   uv_write_t req;
   uv_buf_t buf = { .base = content.data, .len = UV_BUF_LEN(content.size) };
   int ret = uv_write(&req, (uv_stream_t *)&tui->output_handle, &buf, 1, NULL);
@@ -1628,6 +1842,8 @@ void tui_flush(TUIData *tui)
       }
     }
   }
+
+  glide_end_frame(tui);
 
   cursor_goto(tui, tui->row, tui->col);
 

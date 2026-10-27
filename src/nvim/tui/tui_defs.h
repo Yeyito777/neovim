@@ -11,6 +11,7 @@ typedef enum {
   kTermModeSynchronizedOutput = 2026,
   kTermModeGraphemeClusters = 2027,
   kTermModeThemeUpdates = 2031,
+  kTermModeAppSmoothScroll = 2032,  ///< st's app-driven smooth scrolling
   kTermModeResizeEvents = 2048,
 } TermMode;
 
