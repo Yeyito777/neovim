@@ -218,19 +218,27 @@ end
 --- INDEX_MAX entries the ones nearest the root are the ones kept. They are
 --- listed off the main thread, SCANS at a time, so a folder that is slow to
 --- open (on a network or in the cloud) never blocks the editor: after
---- SCAN_TIMEOUT it is skipped. `done` runs once it is all in `kids`.
+--- SCAN_TIMEOUT it is skipped. What they hold is taken in slices of the main
+--- loop (a folder can hold 30,000 files). `done` runs once it is all in `kids`.
 local function walk(job, kids, done)
-  local dir = job.root
-  local prefix = dir == "/" and "/" or dir .. "/"
+  local prefix = job.root == "/" and "/" or job.root .. "/"
   local queue, head, count, busy, finished = { "" }, 1, 0, 0, false
+  local listed = {} ---@type { rel: string, handle: uv.uv_fs_t }[] folders whose entries aren't taken yet
+  local taking = false
   local next_folders
-  local function list(rel, handle)
-    while handle and count < INDEX_MAX do
-      local name, kind = uv.fs_scandir_next(handle)
+  local function take()
+    taking = false
+    if search.job ~= job then
+      return
+    end
+    local deadline = uv.hrtime() + SLICE
+    while listed[1] and count < INDEX_MAX and uv.hrtime() < deadline do
+      local folder = listed[1]
+      local name, kind = uv.fs_scandir_next(folder.handle)
       if not name then
-        break
-      end
-      if name ~= ".git" then
+        table.remove(listed, 1)
+      elseif name ~= ".git" then
+        local rel = folder.rel
         local path = rel == "" and name or rel .. "/" .. name
         local is_dir = kind == "directory"
         if kind ~= "directory" and kind ~= "file" then -- a link, or a filesystem that doesn't say
@@ -245,6 +253,10 @@ local function walk(job, kids, done)
         end
       end
     end
+    if count >= INDEX_MAX then
+      listed = {}
+    end
+    next_folders()
   end
   next_folders = function()
     if search.job ~= job or finished then
@@ -270,11 +282,18 @@ local function walk(job, kids, done)
         settled, busy = true, busy - 1
         timer:stop()
         timer:close()
-        list(rel, handle)
+        if handle then
+          listed[#listed + 1] = { rel = rel, handle = handle }
+        end
         next_folders()
       end)
     end
-    if busy == 0 and (not queue[head] or count >= INDEX_MAX) then
+    if listed[1] then
+      if not taking then
+        taking = true
+        vim.defer_fn(take, 1) -- a timer, so keys typed meanwhile go first
+      end
+    elseif busy == 0 and (not queue[head] or count >= INDEX_MAX) then
       finished = true
       vim.schedule(done)
     end
@@ -285,17 +304,36 @@ end
 --- The entries in tree order: each folder's contents sorted as the tree
 --- sorts them, after the folder.
 local function emit(dir, kids, check)
+  local function less(a, b)
+    if a.dir ~= b.dir then
+      return a.dir
+    end
+    if a.lname ~= b.lname then
+      return a.lname < b.lname
+    end
+    return a.name < b.name
+  end
+  -- A merge sort, which can stop between runs (table.sort can't stop halfway
+  -- through a folder of 30,000 files, and is no faster with a Lua comparator).
   local function sorted(items)
-    table.sort(items, function(a, b)
-      if a.dir ~= b.dir then
-        return a.dir
+    local n = #items
+    local src, dst, width = items, {}, 1
+    while width < n do
+      for i = 1, n, 2 * width do
+        local mid, hi = math.min(i + width, n + 1), math.min(i + 2 * width, n + 1)
+        local a, b = i, mid
+        for k = i, hi - 1 do
+          if b >= hi or (a < mid and not less(src[b], src[a])) then
+            dst[k], a = src[a], a + 1
+          else
+            dst[k], b = src[b], b + 1
+          end
+        end
+        check()
       end
-      if a.lname ~= b.lname then
-        return a.lname < b.lname
-      end
-      return a.name < b.name
-    end)
-    return items
+      src, dst, width = dst, src, width * 2
+    end
+    return src
   end
   local list, by_path = {}, {}
   local prefix = dir == "/" and "/" or dir .. "/"
