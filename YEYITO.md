@@ -99,9 +99,10 @@ tests for the wrapping and Markdown link behavior (`NVIM_TEST_BIN=build/bin/nvim
 
 ## Rollback
 
-The plugin-based setup it replaced (Oct 2026) is backed up in
-`~/.local/backups/nvim-config-20261026/` and `Yeyito777/neovim-config`;
-`~/.local/opt/neovim-visible-wrap` is the previous build.
+The plugin-based setup it replaced (Oct 2026) is archived on both machines in
+`~/.local/backups/nvim-config-20261026/`: old config, plugins, the previous
+patched build and its source changes, with a README on running it again. The
+config is also on GitHub as `Yeyito777/neovim-config` (archived).
 
 ## Ideas (from the old config's TODO.md)
 
