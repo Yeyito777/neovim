@@ -1,7 +1,8 @@
 -- Language servers. Their base definitions (cmd, filetypes, root detection)
--- are in ../../lsp/<name>.lua, which vim.lsp.config picks up from the
--- runtime path; only personal settings live here. Servers that aren't
--- installed are skipped silently.
+-- are servers/<name>.lua, from nvim-lspconfig; only personal settings live
+-- here. (Not in an lsp/ runtime dir, which every Neovim instance would list
+-- in vim.lsp.get_configs().) Servers that aren't installed are skipped
+-- silently.
 local M = {}
 
 local servers = {
@@ -66,6 +67,7 @@ end
 
 function M.setup()
   for name, conf in pairs(servers) do
+    vim.lsp.config(name, require("yeyito.servers." .. name))
     vim.lsp.config(name, conf)
   end
   vim.lsp.enable(vim.tbl_keys(servers))
