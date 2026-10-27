@@ -64,6 +64,11 @@ nvim-lspconfig 107c245 (`lua/yeyito/servers/`) (all Apache-2.0).
 Edit the files, then `./install.sh` (Lua-only changes rebuild in seconds). To
 try a change without installing: `VIMRUNTIME=$PWD/runtime build/bin/nvim`.
 
+To check that a change doesn't alter how things look, render the same file
+with two builds and diff the screens cell by cell (colors included):
+`test/yeyito/screendiff/shot.sh ~/.local/bin/nvim app.py before.txt`, then
+`shot.sh build app.py after.txt` and `cells.py before.txt after.txt`.
+
 Machine-local tweaks, if ever needed, go in `~/.config/nvim/after/plugin/*.lua`
 (it runs after the built-in config; a plain `~/.config/nvim/init.lua` runs
 before it and gets overridden).
