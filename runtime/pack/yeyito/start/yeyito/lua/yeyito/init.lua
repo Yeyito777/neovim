@@ -13,6 +13,7 @@ function M.setup()
   require("yeyito.lsp").setup() -- was nvim-lspconfig
   require("yeyito.statusline").setup() -- was lualine.nvim
   require("yeyito.smoothscroll").setup() -- glides scrolls in st (mode 2032)
+  require("yeyito.sidebar").setup() -- Ctrl+S file sidebar, as in Exocortex
   require("yeyito.completion").setup() -- was nvim-cmp + LuaSnip
   require("yeyito.markdown_refresh").setup()
   require("yeyito.persist_local_marks")

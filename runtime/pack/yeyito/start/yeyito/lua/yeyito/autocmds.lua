@@ -24,7 +24,7 @@ function M.setup()
   })
 
   -- == Keep cursor position.
-  local ignore_ft = { "gitcommit", "gitrebase", "help", "nofile", "quickfix" }
+  local ignore_ft = { "gitcommit", "gitrebase", "help", "nofile", "quickfix", "yeyito-sidebar" }
   -- Save view (cursor, folds, scroll position, etc.) when leaving a buffer
   autocmd("BufWinLeave", {
     group = group,
