@@ -20,7 +20,7 @@ local M = {
   cmd = {
     ids = {}, ---@type table<string|integer, Msg> List of visible messages.
     msg_row = -1, -- Last row of message to distinguish for placing virt_text.
-    last_col = o.columns, -- Crop text to start column of 'last' virt_text.
+    last_col = ui.columns(), -- Crop text to start column of 'last' virt_text.
     last_emsg = 0, -- Time an error was printed that should not be overwritten.
   },
   dupe = 0, -- Number of times message is repeated.
@@ -109,7 +109,7 @@ local function set_virttext(type, tgt)
 
   if M.virt.ids[type] and #chunks == 0 then
     api.nvim_buf_del_extmark(ui.bufs[tgt], ui.ns, M.virt.ids[type])
-    M.cmd.last_col = type == 'last' and o.columns or M.cmd.last_col
+    M.cmd.last_col = type == 'last' and ui.columns() or M.cmd.last_col
     M.virt.ids[type] = nil
   elseif #chunks > 0 then
     local win = ui.wins[tgt]
@@ -123,7 +123,8 @@ local function set_virttext(type, tgt)
     })
     local row = texth.end_row
     local col = fn.virtcol2col(win, row + 1, texth.end_vcol)
-    local scol = fn.screenpos(win, row + 1, col).col ---@type integer
+    -- Screen column; the cmd and dialog windows start at ui.col.
+    local scol = fn.screenpos(win, row + 1, col).col - (tgt ~= 'msg' and ui.col or 0) ---@type integer
 
     if type ~= 'last' then
       -- Calculate at which column to place the virt_text such that it is at the end
@@ -134,13 +135,13 @@ local function set_virttext(type, tgt)
           + (api.nvim_win_get_config(win).border ~= 'none' and 1 or 0)
 
       -- Check if adding the virt_text on this line will exceed the current window width.
-      local maxwidth = math.max(M.msg.width, math.min(o.columns, scol - offset + width))
+      local maxwidth = math.max(M.msg.width, math.min(ui.columns(), scol - offset + width))
       if tgt == 'msg' and api.nvim_win_get_width(win) < maxwidth then
         api.nvim_win_set_width(win, maxwidth)
         M.msg.width = maxwidth
       end
 
-      local mwidth = tgt == 'msg' and M.msg.width or tgt == 'dialog' and o.columns or M.cmd.last_col
+      local mwidth = tgt == 'msg' and M.msg.width or tgt == 'dialog' and ui.columns() or M.cmd.last_col
       if scol - offset + width > mwidth then
         col = fn.virtcol2col(win, row + 1, texth.end_vcol - (scol - offset + width - mwidth))
       end
@@ -153,10 +154,10 @@ local function set_virttext(type, tgt)
       end
     else
       local mode = #M.virt.last[M.virt.idx.mode]
-      local pad = o.columns - width ---@type integer
+      local pad = ui.columns() - width ---@type integer
       local newlines = math.max(0, ui.cmdheight - texth.all)
       row = row + newlines
-      M.cmd.last_col = mode > 0 and 0 or o.columns - (newlines > 0 and 0 or width)
+      M.cmd.last_col = mode > 0 and 0 or ui.columns() - (newlines > 0 and 0 or width)
 
       if newlines > 0 then
         -- Add empty lines to place virt_text on the last screen row.
@@ -336,6 +337,7 @@ function M.show_msg(tgt, kind, content, replace_last, append, id)
   end
 
   if tgt == 'msg' then
+    width = math.min(width, ui.columns())
     api.nvim_win_set_width(ui.wins.msg, width)
     local texth = api.nvim_win_text_height(ui.wins.msg, { start_row = start_row, end_row = row })
     if texth.all > math.ceil(o.lines * 0.5) then
@@ -621,7 +623,8 @@ local function enter_pager()
           in_pager = api.nvim_get_current_win() == ui.wins.pager
         end
         in_pager = in_pager and api.nvim_win_is_valid(ui.wins.pager)
-        local cfg = in_pager and { relative = 'laststatus', col = 0 } or { hide = true }
+        -- Anchored at its right edge: right of ui.col with the width it has.
+        local cfg = in_pager and { relative = 'laststatus', col = 10000 } or { hide = true }
         if in_pager then
           cfg.row, cfg.height, cfg.border = win_row_height_border('pager', height)
         else
@@ -637,6 +640,12 @@ local function enter_pager()
       desc = 'Hide or reposition pager window.',
     })
   end)
+end
+
+--- The area right of ui.col changed width: re-place the 'last' virt_text.
+function M.layout_changed()
+  M.cmd.last_col = ui.columns()
+  set_virttext('last')
 end
 
 --- Adjust visibility and dimensions of the message windows after certain events.

@@ -53,6 +53,7 @@ local M = {
   cmdheight = vim.o.cmdheight, -- 'cmdheight' option value set by user.
   redrawing = false, -- True when redrawing to display UI event.
   wins = { cmd = -1, dialog = -1, msg = -1, pager = -1 },
+  col = 0, -- Screen columns left of the cmdline and message windows (see set_col()).
   bufs = { cmd = -1, dialog = -1, msg = -1, pager = -1 },
   cfg = {
     enable = true,
@@ -76,6 +77,42 @@ local M = {
   },
 }
 
+--- Width of the area right of |M.col| that the cmdline and message windows use.
+---@return integer
+function M.columns()
+  return math.max(1, vim.o.columns - M.col)
+end
+
+--- Keep the cmdline and message windows right of the first `col` screen
+--- columns, e.g. beside a sidebar that runs the full height of the screen.
+---@param col integer
+function M.set_col(col)
+  M.col = math.max(0, math.min(col, vim.o.columns - 1))
+  if not M.msg then
+    return -- Not enabled.
+  end
+  M.check_targets()
+  for type, win in pairs(M.wins) do
+    local cfg = api.nvim_win_get_config(win)
+    if type == 'msg' then
+      -- Right-aligned; only keep it inside the area.
+      if cfg.width > M.columns() then
+        api.nvim_win_set_width(win, M.columns())
+        M.msg.msg.width = M.columns()
+      end
+    else
+      -- The cmdline starts at col; the others are anchored at their right edge.
+      api.nvim_win_set_config(win, {
+        relative = cfg.relative,
+        row = cfg.row,
+        col = type == 'cmd' and M.col or 10000,
+        width = M.columns(),
+      })
+    end
+  end
+  M.msg.layout_changed()
+end
+
 ---Ensure target buffers and windows are still valid.
 function M.check_targets()
   local curtab = api.nvim_get_current_tabpage()
@@ -88,7 +125,10 @@ function M.check_targets()
 
     if not win or not floating then
       -- Open a new window when closed or no longer floating (e.g. wincmd J).
-      local cfg = { col = 0, row = 1, width = 10000, height = 1, noautocmd = true }
+      -- Only the cmdline is anchored at its left edge; the others at their right
+      -- edge (SE), so col 10000 puts them against the right of the screen.
+      local cfg = { col = type == 'cmd' and M.col or 10000, row = 1, width = M.columns(), height = 1 }
+      cfg.noautocmd = true
       cfg.focusable = false
       cfg.style = 'minimal'
       cfg.relative = 'laststatus'
@@ -238,7 +278,7 @@ function M.enable(opts)
   api.nvim_create_autocmd({ 'VimResized', 'TabEnter' }, {
     group = M.augroup,
     callback = function(ev)
-      M.check_targets()
+      M.set_col(M.col) -- Windows follow the new width.
       -- After a tabpage was closed unhide the msg window on the current tabpage.
       if ev.event == 'TabEnter' and next(M.msg.msg.ids) ~= nil then
         api.nvim_win_set_config(M.wins.msg, { hide = false, width = M.msg.msg.width })
