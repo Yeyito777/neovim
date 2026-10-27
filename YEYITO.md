@@ -49,6 +49,11 @@ clangd, typescript-language-server, vscode-html/css-language-server,
 rust-analyzer, lua-language-server), git, latexmk, a clipboard tool. Servers
 that aren't installed are skipped silently.
 
+The Python, Ruby, Perl and Node providers (for remote plugins, which this
+config has none of) are off: with the Python one on, the first Python file of
+a session made Neovim launch every `python3` on `$PATH` looking for pynvim
+and wait for them, up to seconds on the Mac (`options.lua`).
+
 ## Layout of the config
 
 `runtime/pack/yeyito/start/yeyito/`:
@@ -153,7 +158,13 @@ Like Exocortex's sidebar it has its own command line, in its bottom row
   matches highlighted, the nearest match selected. Enter keeps the filter
   (shown as `/text` in the bottom row), Esc or Backspace on an empty bar goes
   back. In a git repository it searches what git sees (tracked and untracked,
-  not ignored); elsewhere every folder but `.git`.
+  not ignored); elsewhere every folder but `.git`, nearest first, up to 50,000
+  files and folders (a home directory has far more).
+- The list of the project's files is built in the background, in slices
+  between keystrokes, so even a home directory never freezes the editor:
+  while the first one builds the list says `searching…`, and Enter or `n`
+  typed meanwhile select their match when it lands. Each `/` rebuilds it
+  (the project may have changed), searching the last one until then.
 - **`n`** / **`N`**: next / previous match (shows the filter again after
   `:noh`).
 - Enter on a file opens it; on a folder it leaves the search and opens the
@@ -172,8 +183,8 @@ Unlike Exocortex it does not reopen at startup (`nvim` is also the
 commit-message and scratch editor). Ctrl+S in insert mode replaces 0.12's
 default LSP signature help there.
 
-Tests: `VIMRUNTIME=runtime build/bin/nvim --headless -u NORC -c 'luafile
-test/yeyito/test_sidebar.lua'` (behavior and search) and `python3
+Tests: `VIMRUNTIME=$PWD/runtime build/bin/nvim --headless -u NORC -c 'luafile
+test/yeyito/test_sidebar.lua'` (behavior and search; `$PWD` because it `cd`s) and `python3
 test/yeyito/test_sidebar_layout.py` (the real TUI on a fake st: full height,
 command line and pager beside it).
 

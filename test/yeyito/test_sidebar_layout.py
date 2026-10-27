@@ -56,15 +56,16 @@ def main():
         t = Term(["src/main.c"], cwd=project, args=["--listen", sock] + list(extra))
         t.read(1.0)
 
-        def layout():
-            out = subprocess.run(
-                [NVIM, "--clean", "--headless", "--server", sock, "--remote-expr",
-                 "luaeval('vim.json.encode(dofile(\"%s\"))')" % layout_file],
-                capture_output=True, text=True, timeout=10)
+        def expr(e):
+            out = subprocess.run([NVIM, "--clean", "--headless", "--server", sock, "--remote-expr", e],
+                                 capture_output=True, text=True, timeout=10)
             return json.loads(out.stdout.strip() or "null")
-        return t, layout
 
-    t, layout = run()
+        def layout():
+            return expr("luaeval('vim.json.encode(dofile(\"%s\"))')" % layout_file)
+        return t, layout, expr
+
+    t, layout, expr = run()
     try:
         l = layout()
         check("ui2 is on", l["ui2"] is True, l)
@@ -84,6 +85,13 @@ def main():
         c = layout()["cur"]
         check("/ opens the sidebar's bar in its bottom row",
               c["row"] == ROWS - 1 and c["col"] == 0 and c["width"] == 27, c)
+        t.keys(b"m")
+        # Row 2 (under the header) is "  src/main.c", its "m" in column 7; the
+        # selection moved on to README.md (the selected row shows no matches:
+        # its CursorLine has a foreground).
+        attrs = expr("json_encode([screenstring(2, 7), screenattr(2, 3), screenattr(2, 7), screenattr(2, 8)])")
+        check("matches are highlighted where they are drawn",
+              attrs is not None and attrs[0] == "m" and attrs[2] != attrs[1] and attrs[3] == attrs[1], attrs)
         t.keys(b"\x1b")
 
         t.keys(b"\t:echomsg 'one' | echomsg 'two' | echomsg 'three'\r")
@@ -108,7 +116,7 @@ def main():
     finally:
         t.close()
 
-    t, layout = run(["--cmd", "let g:yeyito_ui2 = v:false"])
+    t, layout, _ = run(["--cmd", "let g:yeyito_ui2 = v:false"])
     try:
         t.keys(b"\x13")
         l = layout()

@@ -42,10 +42,20 @@ local search = {
   query = "", ---@type string Last search entered with Enter.
   direction = "forward", ---@type "forward"|"backward"
   filter = false,
-  index = nil, ---@type table[]? Every file and folder of the project, in tree order.
+  -- Every file and folder of the project, in tree order: the last complete
+  -- build, for `index_root`. A fresh one builds in the background (`job`)
+  -- each time a search starts; until it lands, searches use this one.
+  index = nil, ---@type table[]?
+  by_path = nil, ---@type table<string, table>? path -> index entry
+  index_root = nil, ---@type string?
+  job = nil, ---@type table?
+  -- Enter or n with no index yet: { from, direction } to select from once it lands.
+  pending = nil, ---@type table?
+  memo = nil, ---@type table? the last matches(): { index, query, list }
 }
 -- The sidebar's own command line while it is open: { mode = "search"|"command",
--- direction, saved = the selection it started from, win, buf }.
+-- direction, saved = the selection it started from, win, buf, shown = the
+-- input the list is filtered to }.
 local bar ---@type table?
 -- The strip below the sidebar's list (its status line and the command line
 -- rows), so the sidebar runs to the bottom of the screen.
@@ -114,12 +124,18 @@ local function scan(dir)
 end
 
 -- Tree order (folders first, case-insensitive) for project-relative entries
--- with `parts` (path components) and `dir`.
+-- with `rel` and `dir`.
+local function parts_of(e)
+  e.parts = e.parts or vim.split(e.rel, "/", { plain = true })
+  return e.parts
+end
+
 local function tree_less(a, b)
-  for i = 1, math.min(#a.parts, #b.parts) do
-    local pa, pb = a.parts[i], b.parts[i]
+  local ap, bp = parts_of(a), parts_of(b)
+  for i = 1, math.min(#ap, #bp) do
+    local pa, pb = ap[i], bp[i]
     if pa ~= pb then
-      local da, db = i < #a.parts or a.dir, i < #b.parts or b.dir
+      local da, db = i < #ap or a.dir, i < #bp or b.dir
       if da ~= db then
         return da
       end
@@ -130,7 +146,17 @@ local function tree_less(a, b)
       return pa < pb
     end
   end
-  return #a.parts < #b.parts
+  return #ap < #bp
+end
+
+--- `a` comes before `b` in the tree: by their places in the index when both
+--- are in it.
+local function before(a, b)
+  local ia, ib = search.by_path and search.by_path[a.path], search.by_path and search.by_path[b.path]
+  if ia and ib then
+    return ia.order < ib.order
+  end
+  return tree_less(a, b)
 end
 
 local function entry(path, dir)
@@ -139,58 +165,201 @@ local function entry(path, dir)
   return { rel = rel, name = parts[#parts], path = path, dir = dir, parts = parts, depth = 0 }
 end
 
---- Every file and folder under the root: git's view of it (tracked and
---- untracked, not ignored) in a repository, else a walk of the folders.
-local function build_index()
-  local list, seen = {}, {}
-  local function add(rel, dir)
-    if not seen[rel] and rel ~= "" and rel ~= "." then
-      seen[rel] = true
-      list[#list + 1] = entry(vim.fs.joinpath(root, rel), dir)
-    end
+-- ── Search index ──────────────────────────────────────────────────────────
+-- Built in slices between keystrokes, so a big folder (a home directory
+-- has hundreds of thousands of files) never freezes the editor.
+
+local INDEX_MAX = 50000 -- entries, in a folder that isn't a git repository
+local SLICE = 8e6 -- ns of index work per turn of the main loop
+
+local index_ready ---@type fun()
+
+local function add_kid(kids, parent, name, dir)
+  local items = kids[parent]
+  if not items then
+    items = {}
+    kids[parent] = items
   end
-  local ok, res = pcall(function()
-    return vim.system({ "git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard" }):wait(3000)
-  end)
-  if ok and res.code == 0 then
-    for rel in (res.stdout or ""):gmatch("[^%z]+") do
-      local dir = vim.fs.dirname(rel)
-      while dir ~= "." and dir ~= "" and not seen[dir] do
-        add(dir, true)
-        dir = vim.fs.dirname(dir)
-      end
-      add(rel, false)
-    end
-  else
-    for name, kind in vim.fs.dir(root, {
-      depth = 32,
-      skip = function(dir)
-        return vim.fs.basename(dir) ~= ".git"
-      end,
-    }) do
-      if vim.fs.basename(name) ~= ".git" then
-        add(name, kind == "directory")
-      end
-      if #list >= 50000 then
+  items[#items + 1] = { name = name, lname = name:lower(), dir = dir }
+end
+
+--- git's view of the project: tracked and untracked files, not ignored ones.
+local function from_git(out, kids, check)
+  local seen = {}
+  for rel in out:gmatch("[^%z]+") do
+    local parent, start = "", 1
+    while true do
+      local slash = rel:find("/", start, true)
+      if not slash then
         break
       end
+      local dir = rel:sub(1, slash - 1)
+      if not seen[dir] then
+        seen[dir] = true
+        add_kid(kids, parent, rel:sub(start, slash - 1), true)
+      end
+      parent, start = dir, slash + 1
+    end
+    local name = rel:sub(start)
+    if name ~= "" and not seen[rel] then
+      seen[rel] = true
+      add_kid(kids, parent, name, false)
+    end
+    check()
+  end
+end
+
+--- Outside a repository: the folders breadth first, so with more than
+--- INDEX_MAX entries the ones nearest the root are the ones kept.
+local function walk(dir, kids, check)
+  local queue, head, count = { "" }, 1, 0
+  while queue[head] and count < INDEX_MAX do
+    local rel = queue[head]
+    head = head + 1
+    local handle = uv.fs_scandir(rel == "" and dir or dir .. "/" .. rel)
+    while handle and count < INDEX_MAX do
+      local name, kind = uv.fs_scandir_next(handle)
+      if not name then
+        break
+      end
+      if name ~= ".git" then
+        local path = rel == "" and name or rel .. "/" .. name
+        local is_dir = kind == "directory"
+        if kind ~= "directory" and kind ~= "file" then -- a link, or a filesystem that doesn't say
+          local stat = uv.fs_stat(dir .. "/" .. path)
+          is_dir = stat ~= nil and stat.type == "directory"
+        end
+        add_kid(kids, rel, name, is_dir)
+        count = count + 1
+        if is_dir and kind ~= "link" then -- not into linked folders: they can loop
+          queue[#queue + 1] = path
+        end
+      end
+      check()
     end
   end
-  table.sort(list, tree_less)
-  search.index = list
-  return list
+end
+
+--- The entries in tree order: each folder's contents sorted as the tree
+--- sorts them, after the folder.
+local function emit(dir, kids, check)
+  local function sorted(items)
+    table.sort(items, function(a, b)
+      if a.dir ~= b.dir then
+        return a.dir
+      end
+      if a.lname ~= b.lname then
+        return a.lname < b.lname
+      end
+      return a.name < b.name
+    end)
+    return items
+  end
+  local list, by_path = {}, {}
+  local prefix = dir == "/" and "/" or dir .. "/"
+  local stack = { { rel = "", i = 0, items = sorted(kids[""] or {}) } }
+  while #stack > 0 do
+    local top = stack[#stack]
+    top.i = top.i + 1
+    local k = top.items[top.i]
+    if not k then
+      stack[#stack] = nil
+    else
+      local rel = top.rel == "" and k.name or top.rel .. "/" .. k.name
+      local e = { rel = rel, name = k.name, lname = k.lname, path = prefix .. rel, dir = k.dir, depth = 0, order = #list + 1 }
+      list[#list + 1] = e
+      by_path[e.path] = e
+      if k.dir and kids[rel] then
+        stack[#stack + 1] = { rel = rel, i = 0, items = sorted(kids[rel]) }
+      end
+      check()
+    end
+  end
+  return list, by_path
+end
+
+--- Build the index of the root anew in the background (unless that is
+--- already happening); `index_ready` runs when it lands.
+local function start_index()
+  if search.job and search.job.root == root then
+    return
+  end
+  local job = { root = root }
+  search.job = job
+  local deadline = 0
+  local function check()
+    if uv.hrtime() > deadline then
+      coroutine.yield()
+    end
+  end
+  local co = coroutine.create(function(git_out)
+    local kids = {}
+    if git_out then
+      from_git(git_out, kids, check)
+    else
+      walk(job.root, kids, check)
+    end
+    return emit(job.root, kids, check)
+  end)
+  local function resume(git_out)
+    if search.job ~= job then
+      return -- superseded or cancelled
+    end
+    deadline = uv.hrtime() + SLICE
+    local ok, list, by_path = coroutine.resume(co, git_out)
+    if not ok then
+      search.job = nil
+      vim.notify("sidebar search index: " .. tostring(list), vim.log.levels.WARN)
+    elseif coroutine.status(co) ~= "dead" then
+      vim.defer_fn(resume, 1) -- a timer, so keys typed meanwhile go first
+    else
+      search.job = nil
+      search.index, search.by_path, search.index_root, search.memo = list, by_path, job.root, nil
+      index_ready()
+    end
+  end
+  local cmd = { "git", "-C", job.root, "ls-files", "-z", "--cached", "--others", "--exclude-standard" }
+  local ok = pcall(vim.system, cmd, {}, function(res)
+    vim.schedule(function()
+      resume(res.code == 0 and (res.stdout or "") or nil)
+    end)
+  end)
+  if not ok then -- no git
+    vim.schedule(resume)
+  end
+end
+
+--- The index of the root, if one has been built.
+local function current_index()
+  return search.index_root == root and search.index or nil
 end
 
 --- Entries matching `query`: case-insensitive, in the name, or in the
---- project-relative path when the query has a /.
+--- project-relative path when the query has a /. Empty while there is no
+--- index yet (it starts building).
 local function matches(query)
+  local index = current_index()
+  if not index then
+    start_index()
+    return {}
+  end
+  local memo = search.memo
+  if memo and memo.index == index and memo.query == query then
+    return memo.list
+  end
   local lq, by_path = query:lower(), query:find("/", 1, true)
   local out = {}
-  for _, e in ipairs(search.index or build_index()) do
-    if (by_path and e.rel or e.name):lower():find(lq, 1, true) then
+  for _, e in ipairs(index) do
+    local hay = e.lname
+    if by_path then
+      hay = e.lrel or e.rel:lower()
+      e.lrel = hay
+    end
+    if hay:find(lq, 1, true) then
       out[#out + 1] = e
     end
   end
+  search.memo = { index = index, query = query, list = out }
   return out
 end
 
@@ -202,14 +371,14 @@ local function next_match(list, from, direction)
   end
   if direction == "forward" then
     for _, e in ipairs(list) do
-      if not from or tree_less(from, e) then
+      if not from or before(from, e) then
         return e
       end
     end
     return list[1]
   end
   for i = #list, 1, -1 do
-    if not from or tree_less(list[i], from) then
+    if not from or before(list[i], from) then
       return list[i]
     end
   end
@@ -292,44 +461,81 @@ end
 
 -- ── Drawing ───────────────────────────────────────────────────────────────
 
+-- Columns of "…" ('ambiwidth'), read again by each render.
+local ellipsis = 1
+
+--- Printable ASCII: as many columns as bytes. (A byte loop: LuaJIT compiles
+--- it, but not a pattern with a character class, which costs 50x more.)
+local function plain(text)
+  for i = 1, #text do
+    local c = text:byte(i)
+    if c < 32 or c > 126 then
+      return false
+    end
+  end
+  return true
+end
+
 local function truncate(text, width)
+  local ascii = plain(text)
+  if ascii and #text <= width then
+    return text
+  end
+  if ascii then
+    return text:sub(1, width - ellipsis) .. "…"
+  end
   if vim.fn.strdisplaywidth(text) <= width then
     return text
   end
-  local out = ""
+  local out, used = {}, ellipsis
   for _, char in ipairs(vim.fn.split(text, "\\zs")) do
-    if vim.fn.strdisplaywidth(out .. char .. "…") > width then
+    used = used + vim.fn.strdisplaywidth(char)
+    if used > width then
       break
     end
-    out = out .. char
+    out[#out + 1] = char
   end
-  return out .. "…"
+  return table.concat(out) .. "…"
 end
 
 --- Keep the end of `text` (the file name) when it is too wide.
 local function truncate_left(text, width)
+  local ascii = plain(text)
+  if ascii and #text <= width then
+    return text
+  end
+  if ascii then
+    return "…" .. text:sub(#text - (width - ellipsis) + 1)
+  end
   if vim.fn.strdisplaywidth(text) <= width then
     return text
   end
   local chars = vim.fn.split(text, "\\zs")
-  local out = ""
+  local out, used = {}, ellipsis
   for i = #chars, 1, -1 do
-    if vim.fn.strdisplaywidth("…" .. chars[i] .. out) > width then
+    used = used + vim.fn.strdisplaywidth(chars[i])
+    if used > width then
       break
     end
-    out = chars[i] .. out
+    table.insert(out, 1, chars[i])
   end
-  return "…" .. out
+  return "…" .. table.concat(out)
+end
+
+--- A name as it can be shown: a newline or other control character in it
+--- (a buffer line can't hold a newline) is a "?".
+local function printable(name)
+  return not plain(name) and name:find("%c") and (name:gsub("%c", "?")) or name
 end
 
 local function label(row)
   if row.rel then -- a search match: its path in the project
-    return (row.dir and "📁 " or "") .. truncate_left(row.rel .. (row.dir and "/" or ""), WIDTH - 3 - (row.dir and 3 or 0))
+    return (row.dir and "📁 " or "") .. truncate_left(printable(row.rel) .. (row.dir and "/" or ""), WIDTH - 3 - (row.dir and 3 or 0))
   end
   if row.dir then
-    return (expanded[row.path] and "📂 " or "📁 ") .. row.name .. "/"
+    return (expanded[row.path] and "📂 " or "📁 ") .. printable(row.name) .. "/"
   end
-  return row.name
+  return printable(row.name)
 end
 
 local function cursor_row(win)
@@ -376,45 +582,69 @@ local function header()
   return "%#YeyitoSidebarHeader# " .. truncate(name, WIDTH - 3):gsub("%%", "%%%%")
 end
 
+-- Matches are highlighted like a search in the editor, on the rows being
+-- drawn: a filter with thousands of matches costs a screenful.
+local shown_query ---@type string? the filter shown, lowercased
+local function highlight_matches()
+  api.nvim_set_decoration_provider(match_ns, {
+    on_win = function(_, _, b)
+      return b == buf and shown_query ~= nil
+    end,
+    on_line = function(_, _, b, row)
+      if not rows[row + 1] then
+        return -- "no matches"
+      end
+      local line = (api.nvim_buf_get_lines(b, row, row + 1, false)[1] or ""):lower()
+      local from = 1
+      while true do
+        local s, e = line:find(shown_query, from, true)
+        if not s then
+          break
+        end
+        api.nvim_buf_set_extmark(b, match_ns, row, s - 1, {
+          end_col = e,
+          hl_group = "YeyitoSidebarMatch",
+          priority = 300,
+          ephemeral = true,
+        })
+        from = e + 1
+      end
+    end,
+  })
+end
+
 local function render(keep_path)
   if not (buf and api.nvim_buf_is_valid(buf)) then
     return
   end
   local win = sidebar_win()
   keep_path = keep_path or (win and (cursor_row(win) or {}).path)
+  ellipsis = vim.fn.strdisplaywidth("…")
   build()
   local lines = {}
   local target
   for i, row in ipairs(rows) do
-    local indent = "  " .. INDENT:rep(row.depth)
-    lines[i] = indent .. truncate(label(row), WIDTH - 1 - #indent)
+    local line = row.line -- a search match keeps its line: the index doesn't change under it
+    if row.rel and not line then
+      line = "  " .. label(row) -- sized to fit already
+      row.line = line
+    elseif not line then
+      local indent = "  " .. INDENT:rep(row.depth)
+      line = indent .. truncate(label(row), WIDTH - 1 - #indent)
+    end
+    lines[i] = line
     if row.path == keep_path then
       target = i
     end
   end
   local query = active_query()
   if query and #rows == 0 then
-    lines = { "  no matches" }
+    lines = { current_index() and "  no matches" or "  searching…" }
   end
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  -- Matches are highlighted like a search in the editor.
-  api.nvim_buf_clear_namespace(buf, match_ns, 0, -1)
-  if query then
-    local lq = query:lower()
-    for i, line in ipairs(lines) do
-      local from = 1
-      while rows[i] do
-        local s, e = line:lower():find(lq, from, true)
-        if not s then
-          break
-        end
-        api.nvim_buf_set_extmark(buf, match_ns, i - 1, s - 1, { end_col = e, hl_group = "YeyitoSidebarMatch", priority = 300 })
-        from = e + 1
-      end
-    end
-  end
+  shown_query = query and query:lower() or nil
   if win then
     vim.wo[win].winbar = header()
     if target then
@@ -642,12 +872,34 @@ local function live_search()
     return
   end
   local input = api.nvim_buf_get_lines(bar.buf, 0, 1, false)[1] or ""
+  if input == bar.shown then
+    return -- several edits queued this; the first one showed it
+  end
+  bar.shown = input
   local target = bar.saved and bar.saved.path
   if input ~= "" then
     local hit = next_match(matches(input), bar.saved, bar.direction)
     target = hit and hit.path or target
   end
   render(target)
+end
+
+--- A new index landed: show the search again with it.
+index_ready = function()
+  local pending = search.pending
+  search.pending = nil
+  if not sidebar_win() then
+    return
+  end
+  if bar and bar.mode == "search" then
+    bar.shown = nil
+    live_search()
+  elseif search.filter then
+    -- Enter or n waited for it: select the match they would have.
+    local hit = pending and next_match(matches(search.query), pending.from, pending.direction)
+    render(hit and hit.path or nil)
+    update_foot()
+  end
 end
 
 local function run_command(cmd)
@@ -702,6 +954,9 @@ local function submit_bar()
     return
   end
   search.query, search.direction, search.filter = input, b.direction, true
+  if not current_index() then
+    search.pending = { from = b.saved, direction = b.direction }
+  end
   local hit = next_match(matches(input), b.saved, b.direction)
   close_bar(false)
   render(hit and hit.path or (b.saved and b.saved.path))
@@ -716,7 +971,7 @@ function M.open_bar(mode, direction)
   end
   close_bar(true)
   if mode == "search" then
-    build_index() -- the project may have changed since the last search
+    start_index() -- the project may have changed since the last search
   end
   local b = api.nvim_create_buf(false, true)
   vim.bo[b].bufhidden = "wipe"
@@ -815,6 +1070,9 @@ function M.search_next(reverse)
   local direction = search.direction
   if reverse then
     direction = direction == "forward" and "backward" or "forward"
+  end
+  if not current_index() then
+    search.pending = { from = selected_entry(), direction = direction }
   end
   local hit = next_match(matches(search.query), selected_entry(), direction)
   render(hit and hit.path)
@@ -945,6 +1203,7 @@ end
 --- Close it, back to the editor.
 function M.close()
   close_bar(true)
+  search.job = nil -- no index work while it's closed
   local win = sidebar_win()
   if not win then
     return
@@ -999,6 +1258,7 @@ end
 
 function M.setup()
   highlights()
+  highlight_matches()
   vim.keymap.set("n", "<C-s>", M.toggle, { desc = "File sidebar: open focused / close" })
   vim.keymap.set("x", "<C-s>", "<Esc><Cmd>lua require('yeyito.sidebar').toggle()<CR>", { desc = "File sidebar: open focused / close" })
   vim.keymap.set("i", "<C-s>", "<Esc><Cmd>lua require('yeyito.sidebar').toggle()<CR>", { desc = "File sidebar: open focused / close" })
@@ -1040,6 +1300,7 @@ function M.setup()
       if sidebar_win() then
         root = vim.fs.normalize(vim.fn.getcwd())
         expanded = {}
+        search.job = nil -- the next search indexes the new root
         refresh()
       end
     end,

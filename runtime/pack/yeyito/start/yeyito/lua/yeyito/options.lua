@@ -21,6 +21,15 @@ function M.setup()
   vim.g.mapleader = " "
   vim.g.maplocalleader = " "
 
+  -- No remote plugins, so no language providers. With them, the first Python
+  -- buffer's ftplugin (`has('python3')`) runs every python3 on $PATH in turn
+  -- to look for pynvim while the editor waits: 0.3-0.6 s on the Mac, seconds
+  -- when those Pythons aren't in the disk cache.
+  vim.g.loaded_python3_provider = 0
+  vim.g.loaded_ruby_provider = 0
+  vim.g.loaded_perl_provider = 0
+  vim.g.loaded_node_provider = 0
+
   -- Mark configuration
   vim.opt.signcolumn = "yes"
   vim.opt.fillchars:append({ msgsep = " " })

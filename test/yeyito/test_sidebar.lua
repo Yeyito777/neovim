@@ -212,6 +212,26 @@ local function search_steps()
     check(": runs Ex commands in the editor", vim.fs.basename(name) == "README.md", name)
     check("focus stays in the sidebar", api.nvim_get_current_win() == S.side)
     vim.cmd("tabclose")
+    -- A new project: its index builds in the background when / opens, so
+    -- this Enter comes before it lands.
+    local dir = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(dir .. "/docs", "p")
+    for _, f in ipairs({ "README.md", "docs/guide.md", "new\nline.txt" }) do
+      vim.fn.writefile({ "x" }, dir .. "/" .. f)
+    end
+    vim.cmd("tabnew")
+    vim.cmd.cd(dir)
+    vim.cmd.edit("README.md")
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    S.tree = lines()
+    send("/gui<CR>")
+  end)
+  step(function()
+    check("a newline in a name shows as ?", vim.tbl_contains(S.tree, "  new?line.txt"), S.tree)
+    check("Enter before the index is built: the match once it lands", vim.deep_equal(lines(), { "  docs/guide.md" })
+      and selected() == "docs/guide.md", { lines(), selected() })
+    vim.cmd("tabclose")
   end)
   return steps
 end
