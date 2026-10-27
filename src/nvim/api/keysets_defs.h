@@ -56,6 +56,7 @@ typedef struct {
   HLGroupID line_hl_group;
   HLGroupID cursorline_hl_group;
   String conceal;
+  Boolean conceal_compact;
   String conceal_lines;
   Boolean spell;
   Boolean ui_watched;

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "nvim/decoration.h"
 #include "nvim/marktree_defs.h"
 #include "nvim/pos_defs.h"
 #include "nvim/types_defs.h"
@@ -24,6 +25,8 @@ typedef struct {
                              ///< parts of lines, INT_MIN if not yet calculated.
 
   int virt_row;              ///< Row for virtual text, -1 if no virtual text.
+  int compact_row;           ///< Row for compact conceal, -1 if inactive.
+  DecorCompactState compact_state;  ///< Persistent range iterator; safe to copy for lookahead.
   int cur_text_width_left;   ///< Width of virtual text left of cursor.
   int cur_text_width_right;  ///< Width of virtual text right of cursor.
 

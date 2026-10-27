@@ -68,6 +68,16 @@ typedef union {
   int next_free_i;
 } DecorRangeSlot;
 
+/// Monotonic iterator for persistent compact-conceal ranges on one buffer row.
+/// This has no allocated storage, so it is safe to copy for lookahead.
+typedef struct {
+  MarkTreeIter itr[1];
+  int row;
+  int last_col;
+  int compact_until;
+  bool initialized;
+} DecorCompactState;
+
 typedef struct {
   MarkTreeIter itr[1];
   kvec_t(DecorRangeSlot) slots;
@@ -92,6 +102,7 @@ typedef struct {
   int conceal;
   schar_T conceal_char;
   int conceal_attr;
+  bool conceal_compact;
 
   TriState spell;
 

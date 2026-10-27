@@ -1213,6 +1213,11 @@ int jump_to_mouse(int flags, bool *inclusive, int which_button)
   int grid = mouse_grid;
   int fdc = 0;
   bool keep_focus = flags & MOUSE_FOCUS;
+  win_T *captured_wp = NULL;
+  linenr_T captured_lnum = 0;
+  int captured_row = 0;
+  int captured_col = 0;
+  int captured_compact_row = -1;
 
   mouse_past_bottom = false;
   mouse_past_eol = false;
@@ -1287,6 +1292,30 @@ retnomove:
       on_sep_line = false;
     } else {
       on_status_line = false;
+    }
+  }
+
+  // Capture buffer geometry before changing focus, the cursor line, or Visual
+  // mode.  Those changes can reveal compact conceal, while the click still
+  // refers to the cells drawn with the old conceal state.
+  if (wp->w_buffer->b_has_compact_conceal
+      && !below_window && !on_status_line && !on_sep_line && !on_winbar && !on_statuscol
+      && row >= 0 && row < wp->w_view_height && col >= 0 && col < wp->w_view_width) {
+    captured_wp = wp;
+    captured_row = row;
+    captured_col = col;
+    if (mouse_comp_pos(wp, &captured_row, &captured_col, &captured_lnum)) {
+      captured_wp = NULL;
+    } else {
+      colnr_T captured_grid_col = -1;
+      int ignored_flags = 0;
+      mouse_check_grid(wp, &captured_grid_col, &ignored_flags);
+      if (captured_grid_col >= 0) {
+        captured_col = captured_grid_col;
+      }
+      if (decor_compact_active(wp, (int)captured_lnum - 1)) {
+        captured_compact_row = (int)captured_lnum - 1;
+      }
     }
   }
 
@@ -1501,10 +1530,14 @@ retnomove:
 foldclick:;
   colnr_T col_from_screen = -1;
   int mouse_fold_flags = 0;
-  mouse_check_grid(&col_from_screen, &mouse_fold_flags);
+  mouse_check_grid(curwin, &col_from_screen, &mouse_fold_flags);
 
   // compute the position in the buffer line from the posn on the screen
-  if (mouse_comp_pos(curwin, &row, &col, &curwin->w_cursor.lnum)) {
+  if (captured_wp == curwin && captured_lnum > 0) {
+    row = captured_row;
+    col = captured_col;
+    curwin->w_cursor.lnum = captured_lnum;
+  } else if (mouse_comp_pos(curwin, &row, &col, &curwin->w_cursor.lnum)) {
     mouse_past_bottom = true;
   }
 
@@ -1528,7 +1561,10 @@ foldclick:;
 
   curwin->w_curswant = col;
   curwin->w_set_curswant = false;       // May still have been true
-  if (coladvance(curwin, col) == FAIL) {        // Mouse click beyond end of line
+  int coladvance_result = captured_wp == curwin && captured_lnum > 0
+                          ? coladvance_with_compact(curwin, col, captured_compact_row)
+                          : coladvance(curwin, col);
+  if (coladvance_result == FAIL) {        // Mouse click beyond end of line
     if (inclusive != NULL) {
       *inclusive = true;
     }
@@ -1806,8 +1842,19 @@ colnr_T vcol2col(win_T *wp, linenr_T lnum, colnr_T vcol, colnr_T *coladdp)
   CSType cstype = init_charsize_arg(&csarg, wp, lnum, line);
   StrCharInfo ci = utf_ptr2StrCharInfo(line);
   int cur_vcol = 0;
-  while (cur_vcol < vcol && *ci.ptr != NUL) {
-    int next_vcol = cur_vcol + win_charsize(cstype, cur_vcol, ci.ptr, ci.chr.value, &csarg).width;
+  while (*ci.ptr != NUL) {
+    int width = win_charsize(cstype, cur_vcol, ci.ptr, ci.chr.value, &csarg).width;
+    // A compact-concealed range has no screen cell of its own.  At an exact
+    // vcol tie, map to the next visible character rather than the first hidden
+    // byte.  Positive-width characters retain the old boundary behavior.
+    if (width == 0) {
+      ci = utfc_next(ci);
+      continue;
+    }
+    if (cur_vcol >= vcol) {
+      break;
+    }
+    int next_vcol = cur_vcol + width;
     if (next_vcol > vcol) {
       break;
     }
@@ -1892,7 +1939,7 @@ static linenr_T find_longest_lnum(void)
 }
 
 /// Check clicked cell on its grid
-static void mouse_check_grid(colnr_T *vcolp, int *flagsp)
+static void mouse_check_grid(win_T *wp, colnr_T *vcolp, int *flagsp)
   FUNC_ATTR_NONNULL_ALL
 {
   int click_grid = mouse_grid;
@@ -1900,15 +1947,15 @@ static void mouse_check_grid(colnr_T *vcolp, int *flagsp)
   int click_col = mouse_col;
 
   // XXX: this doesn't change click_grid if it is 1, even with multigrid
-  if (mouse_find_win_inner(&click_grid, &click_row, &click_col) != curwin
+  if (mouse_find_win_inner(&click_grid, &click_row, &click_col) != wp
       // Only use vcols[] after the window was redrawn.  Mainly matters
       // for tests, a user would not click before redrawing.
-      || curwin->w_redr_type != 0) {
+      || wp->w_redr_type != 0) {
     return;
   }
   int start_row = 0;
   int start_col = 0;
-  ScreenGrid *gp = grid_adjust(&curwin->w_grid, &start_row, &start_col);
+  ScreenGrid *gp = grid_adjust(&wp->w_grid, &start_row, &start_col);
   if (gp->handle != click_grid || gp->chars == NULL) {
     return;
   }

@@ -2697,6 +2697,7 @@ static void f_has(typval_T *argvars, typval_T *rettv, EvalFuncData fptr)
     "cmdwin",
     "comments",
     "conceal",
+    "conceal_compact",
     "cursorbind",
     "cursorshape",
     "dialog_con",

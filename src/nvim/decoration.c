@@ -118,6 +118,9 @@ void decor_redraw(buf_T *buf, int row1, int row2, int col1, DecorInline decor)
 
 void decor_redraw_sh(buf_T *buf, int row1, int row2, DecorSignHighlight sh)
 {
+  if (sh.flags & kSHConcealCompact) {
+    changed_lines_invalidate_buf(buf, row1 + 1, 0, MAX(row1, row2) + 2, 0);
+  }
   if (sh.hl_id || (sh.url != NULL)
       || (sh.flags & (kSHIsSign | kSHSpellOn | kSHSpellOff | kSHConceal))) {
     if (row2 >= row1) {
@@ -766,6 +769,7 @@ next_mark:
 
   int attr = 0;
   int conceal = 0;
+  bool compact = false;
   schar_T conceal_char = 0;
   int conceal_attr = 0;
   TriState spell = kNone;
@@ -789,6 +793,9 @@ next_mark:
         attr = hl_combine_attr(attr, r->attr_id);
       }
 
+      if (r->kind == kDecorKindHighlight && (r->data.sh.flags & kSHConcealCompact)) {
+        compact = true;
+      }
       if (r->kind == kDecorKindHighlight && (r->data.sh.flags & kSHConceal)) {
         conceal = 1;
         if (r->start_row == row && r->start_col == col) {
@@ -847,10 +854,116 @@ next_mark:
 
   state->current = attr;
   state->conceal = conceal;
-  state->conceal_char = conceal_char;
+  state->conceal_compact = compact;
+  state->conceal_char = compact ? 0 : conceal_char;
   state->conceal_attr = conceal_attr;
   state->spell = spell;
   return attr;
+}
+
+/// Whether persistent compact conceal can affect the geometry of this line.
+bool decor_compact_active(win_T *wp, int row)
+{
+  if (row < 0 || !wp->w_buffer->b_has_compact_conceal || wp->w_p_cole < 2
+      || (wp == curwin && row + 1 == wp->w_cursor.lnum && !conceal_cursor_line(wp))) {
+    return false;
+  }
+  if (VIsual_active && wp->w_buffer == curbuf && strchr(wp->w_p_cocu, 'v') == NULL
+      && row + 1 >= MIN(VIsual.lnum, curwin->w_cursor.lnum)
+      && row + 1 <= MAX(VIsual.lnum, curwin->w_cursor.lnum)) {
+    return false;
+  }
+  return true;
+}
+
+static bool decor_is_compact(DecorInline decor)
+{
+  if (!decor.ext) {
+    return decor.data.hl.flags & kSHConcealCompact;
+  }
+  for (uint32_t idx = decor.data.ext.sh_idx; idx != DECOR_ID_INVALID;
+       idx = kv_A(decor_items, idx).next) {
+    if (kv_A(decor_items, idx).flags & kSHConcealCompact) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void decor_compact_state_reset(DecorCompactState *state)
+{
+  *state = (DecorCompactState){ .row = -1, .last_col = -1 };
+}
+
+static void decor_compact_include(win_T *wp, int row, DecorCompactState *state,
+                                  MTKey start, MTPos end)
+{
+  if (!mt_invalid(start) && ns_in_win(start.ns, wp)
+      && decor_is_compact(mt_decor(start))
+      && (end.row > row || (end.row == row && end.col > 0))) {
+    state->compact_until = end.row > row ? MAXCOL : MAX(state->compact_until, end.col);
+  }
+}
+
+/// Query persistent compact-conceal ranges while advancing monotonically across a row.
+/// Unlike decor_compact_at(), this deliberately does not inspect conceallevel, mode,
+/// cursor position or Visual state. The caller decides whether compact projection is active.
+bool decor_compact_at_state(win_T *wp, int row, int col, DecorCompactState *state)
+{
+  if (row < 0 || col < 0 || !wp->w_buffer->b_has_compact_conceal) {
+    return false;
+  }
+
+  MarkTree *tree = wp->w_buffer->b_marktree;
+  if (!state->initialized || state->row != row || col < state->last_col) {
+    decor_compact_state_reset(state);
+    state->initialized = true;
+    state->row = row;
+
+    MTPair pair;
+    if (!marktree_itr_get_overlap(tree, row, 0, state->itr)) {
+      state->last_col = col;
+      return false;
+    }
+    while (marktree_itr_step_overlap(tree, state->itr, &pair)) {
+      decor_compact_include(wp, row, state, pair.start, pair.end_pos);
+    }
+  }
+
+  while (marktree_itr_valid(state->itr)) {
+    MTKey mark = marktree_itr_current(state->itr);
+    if (mark.pos.row > row || (mark.pos.row == row && mark.pos.col > col)) {
+      break;
+    }
+    if (mark.pos.row == row && mt_start(mark)) {
+      MTPos end = marktree_get_altpos(tree, mark, NULL);
+      decor_compact_include(wp, row, state, mark, end);
+    }
+    marktree_itr_next(tree, state->itr);
+  }
+
+  state->last_col = col;
+  return col < state->compact_until;
+}
+
+/// Raw point query used when geometry must be captured independently of the
+/// current mode/cursor conceal policy (for example before focusing a mouse click).
+bool decor_compact_at_raw(win_T *wp, int row, int col)
+{
+  DecorCompactState state;
+  decor_compact_state_reset(&state);
+  return decor_compact_at_state(wp, row, col, &state);
+}
+
+/// Query persistent ranges without touching the renderer's global DecorState.
+/// Range starts are inclusive and ends are exclusive. The lookup works for
+/// multibyte characters and split windows.
+bool decor_compact_at(win_T *wp, int row, int col)
+{
+  if (!decor_compact_active(wp, row)) {
+    return false;
+  }
+  return decor_compact_at_raw(wp, row, col);
 }
 
 static const uint32_t conceal_filter[kMTMetaCount] = {[kMTMetaConcealLines] = kMTFilterSelect };
@@ -1219,6 +1332,9 @@ void decor_to_dict_legacy(Dict *dict, DecorInline decor, bool hl_name, Arena *ar
     PUT_C(*dict, "conceal", CSTR_TO_ARENA_OBJ(arena, buf));
   }
 
+  if (sh_hl.flags & kSHConcealCompact) {
+    PUT_C(*dict, "conceal_compact", BOOLEAN_OBJ(true));
+  }
   if (sh_hl.flags & kSHConcealLines) {
     PUT_C(*dict, "conceal_lines", STRING_OBJ(cstr_as_string("")));
   }

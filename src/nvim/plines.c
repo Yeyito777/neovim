@@ -100,22 +100,49 @@ CSType init_charsize_arg(CharsizeArg *csarg, win_T *wp, linenr_T lnum, char *lin
   csarg->cur_text_width_left = 0;
   csarg->cur_text_width_right = 0;
   csarg->virt_row = -1;
+  csarg->compact_row = -1;
+  decor_compact_state_reset(&csarg->compact_state);
   csarg->indent_width = INT_MIN;
   csarg->use_tabstop = !wp->w_p_list || wp->w_p_lcs_chars.tab1;
 
   if (lnum > 0) {
+    // Some editing callers pass a suffix or copied string together with a real
+    // lnum. Only an actual buffer-line origin can be mapped to extmark columns.
+    if (lnum <= wp->w_buffer->b_ml.ml_line_count && decor_compact_active(wp, lnum - 1)
+        && line == ml_get_buf(wp->w_buffer, lnum)) {
+      csarg->compact_row = lnum - 1;
+    }
     if (marktree_itr_get_filter(wp->w_buffer->b_marktree, lnum - 1, 0, lnum, 0,
                                 inline_filter, csarg->iter)) {
       csarg->virt_row = lnum - 1;
     }
   }
 
-  if (csarg->virt_row >= 0
+  if (csarg->virt_row >= 0 || csarg->compact_row >= 0
       || (wp->w_p_wrap && (wp->w_p_lbr || wp->w_p_bri || *get_showbreak_value(wp) != NUL))) {
     return kCharsizeRegular;
   } else {
     return kCharsizeFast;
   }
+}
+
+static bool charsize_compact_at(CharsizeArg *csarg, int col)
+{
+  return csarg->compact_row >= 0
+         && decor_compact_at_state(csarg->win, csarg->compact_row, col,
+                                   &csarg->compact_state);
+}
+
+/// Advance past a character and any following compact-concealed source.
+static char *next_compact_visible(CharsizeArg *csarg, DecorCompactState *state, char *p)
+{
+  MB_PTR_ADV(p);
+  while (*p != NUL && csarg->compact_row >= 0
+         && decor_compact_at_state(csarg->win, csarg->compact_row,
+                                   (int)(p - csarg->line), state)) {
+    MB_PTR_ADV(p);
+  }
+  return p;
 }
 
 /// Get the number of cells taken up on the screen for the given arguments.
@@ -135,7 +162,9 @@ CharSize charsize_regular(CharsizeArg *csarg, char *const cur, colnr_T const vco
   win_T *wp = csarg->win;
   buf_T *buf = wp->w_buffer;
   char *line = csarg->line;
-  bool const use_tabstop = cur_char == TAB && csarg->use_tabstop;
+  bool compact = *cur != NUL && csarg->compact_row >= 0
+                 && charsize_compact_at(csarg, (int)(cur - line));
+  bool const use_tabstop = !compact && cur_char == TAB && csarg->use_tabstop;
   int mb_added = 0;
 
   bool has_lcs_eol = wp->w_p_list && wp->w_p_lcs_chars.eol != NUL;
@@ -143,7 +172,9 @@ CharSize charsize_regular(CharsizeArg *csarg, char *const cur, colnr_T const vco
   // First get normal size, without 'linebreak' or inline virtual text
   int size;
   int is_doublewidth = false;
-  if (use_tabstop) {
+  if (compact) {
+    size = 0;
+  } else if (use_tabstop) {
     size = tabstop_padding(vcol, buf->b_p_ts, buf->b_p_vts_array);
   } else if (*cur == NUL) {
     // 1 cell for EOL list char (if present), as opposed to the two cell ^@
@@ -291,8 +322,10 @@ CharSize charsize_regular(CharsizeArg *csarg, char *const cur, colnr_T const vco
   bool need_lbr = false;
   // If 'linebreak' set check at a blank before a non-blank if the line
   // needs a break here.
-  if (wp->w_p_lbr && wp->w_p_wrap && wp->w_view_width != 0
-      && vim_isbreak((uint8_t)cur[0]) && !vim_isbreak((uint8_t)cur[1])) {
+  DecorCompactState compact_lookahead = csarg->compact_state;
+  if (!compact && wp->w_p_lbr && wp->w_p_wrap && wp->w_view_width != 0
+      && vim_isbreak((uint8_t)cur[0])
+      && !vim_isbreak((uint8_t)*next_compact_visible(csarg, &compact_lookahead, cur))) {
     char *t = csarg->line;
     while (vim_isbreak((uint8_t)t[0])) {
       t++;
@@ -316,9 +349,10 @@ CharSize charsize_regular(CharsizeArg *csarg, char *const cur, colnr_T const vco
     }
 
     colnr_T vcol2 = vcol;
+    compact_lookahead = csarg->compact_state;
     while (true) {
       char *ps = s;
-      MB_PTR_ADV(s);
+      s = next_compact_visible(csarg, &compact_lookahead, s);
       int c = (uint8_t)(*s);
       if (!(c != NUL
             && (vim_isbreak(c) || vcol2 == vcol || !vim_isbreak((uint8_t)(*ps))))) {
@@ -579,11 +613,13 @@ void getvcol(win_T *wp, pos_T *pos, colnr_T *start, colnr_T *cursor, colnr_T *en
   }
 
   if (end != NULL) {
-    *end = vcol + incr - 1;
+    // All source positions in a compact range project onto the same boundary.
+    // Keep start/cursor/end monotonic instead of exposing vcol - 1.
+    *end = incr == 0 ? vcol + head : vcol + incr - 1;
   }
 
   if (cursor != NULL) {
-    if (ci.chr.value == TAB
+    if (incr > 0 && ci.chr.value == TAB
         && (State & MODE_NORMAL)
         && !wp->w_p_list
         && !virtual_active(wp)

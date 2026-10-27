@@ -1137,6 +1137,9 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
   int prev_syntax_id = 0;
   int conceal_attr = win_hl_attr(wp, HLF_CONCEAL);
   bool is_concealing = false;
+  bool is_compact_concealing = false;
+  DecorCompactState compact_state;
+  decor_compact_state_reset(&compact_state);
   bool did_wcol = false;
 #define vcol_hlc(wlv) ((wlv).vcol - (wlv).vcol_off_co)
 
@@ -2318,19 +2321,34 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
         //
         // So only allow to linebreak, once we have found chars not in
         // 'breakat' in the line.
-        if (wp->w_p_lbr && !wlv.need_lbr && mb_schar != NUL
-            && !vim_isbreak((uint8_t)(*ptr))) {
+        char *lbr_next = ptr;
+        bool compact_break = false;
+        if (wp->w_p_lbr && decor_compact_active(wp, lnum - 1)) {
+          compact_break = decor_compact_at_state(wp, lnum - 1, (int)(prev_ptr - line),
+                                                &compact_state);
+          DecorCompactState lookahead = compact_state;
+          while (!compact_break && *lbr_next != NUL
+                 && decor_compact_at_state(wp, lnum - 1, (int)(lbr_next - line), &lookahead)) {
+            MB_PTR_ADV(lbr_next);
+          }
+        }
+        if (wp->w_p_lbr && !compact_break && !wlv.need_lbr && mb_schar != NUL
+            && !vim_isbreak((uint8_t)(*lbr_next))) {
           wlv.need_lbr = true;
         }
         // Found last space before word: check for line break.
-        if (wp->w_p_lbr && c0 == mb_c && mb_c < 128 && wlv.need_lbr
-            && vim_isbreak(mb_c) && !vim_isbreak((uint8_t)(*ptr))) {
+        if (wp->w_p_lbr && !compact_break && c0 == mb_c && mb_c < 128 && wlv.need_lbr
+            && vim_isbreak(mb_c) && !vim_isbreak((uint8_t)(*lbr_next))) {
           int mb_off = utf_head_off(line, ptr - 1);
           char *p = ptr - (mb_off + 1);
 
           CharsizeArg csarg;
           // lnum == 0, do not want virtual text to be counted here
           CSType cstype = init_charsize_arg(&csarg, wp, 0, line);
+          csarg.compact_row = decor_compact_active(wp, lnum - 1) ? lnum - 1 : -1;
+          if (csarg.compact_row >= 0) {
+            cstype = kCharsizeRegular;
+          }
           wlv.n_extra = win_charsize(cstype, wlv.vcol, p, utf_ptr2CharInfo(p).value,
                                      &csarg).width - 1;
 
@@ -2610,9 +2628,11 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
           && (wp != curwin || lnum != wp->w_cursor.lnum || conceal_cursor_line(wp))
           && ((syntax_flags & HL_CONCEAL) != 0 || has_match_conc > 0 || decor_conceal > 0)
           && !(lnum_in_visual_area && vim_strchr(wp->w_p_cocu, 'v') == NULL)) {
+        is_compact_concealing = wp->w_p_cole >= 2 && decor_conceal > 0
+                                && decor_state.conceal_compact;
         bool syntax_conceal = (syntax_flags & HL_CONCEAL) != 0;
         wlv.char_attr = conceal_attr;
-        if (((prev_syntax_id != syntax_seqnr && syntax_conceal)
+        if (!is_compact_concealing && ((prev_syntax_id != syntax_seqnr && syntax_conceal)
              || has_match_conc > 1 || decor_conceal > 1)
             && ((syntax_conceal && syn_get_sub_char() != NUL)
                 || (has_match_conc && match_conc)
@@ -2663,6 +2683,7 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
       } else {
         prev_syntax_id = 0;
         is_concealing = false;
+        is_compact_concealing = false;
       }
 
       if (wlv.skip_cells > 0 && did_decrement_ptr) {
@@ -3005,6 +3026,13 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
       }
       wlv.off++;
       wlv.col++;
+    } else if (wp->w_p_cole > 0 && is_concealing && is_compact_concealing) {
+      // Compact conceal is zero-width in both rendering and CharsizeArg geometry.
+      // Do not invent columns to force wrapping at the underlying source width.
+      wlv.skip_cells--;
+      wlv.n_extra = 0;
+      wlv.n_attr = 0;
+      wlv.vcol--;  // common code below advances one cell
     } else if (wp->w_p_cole > 0 && is_concealing) {
       bool concealed_wide = schar_cells(mb_schar) > 1;
 
@@ -3103,6 +3131,21 @@ int win_line(win_T *wp, linenr_T lnum, int startrow, int endrow, int col_rows, b
     }
 
 end_check:
+    // A compact-concealed suffix is not more screen text. In particular, do not
+    // allocate an empty continuation row when the visible label exactly fills
+    // the right margin and only its hidden destination remains.
+    if (wlv.col >= view_width && wlv.filler_todo <= 0 && wlv.n_extra == 0
+        && !may_have_inline_virt && decor_compact_active(wp, lnum - 1)) {
+      char *tail = ptr;
+      DecorCompactState lookahead = compact_state;
+      while (*tail != NUL
+             && decor_compact_at_state(wp, lnum - 1, (int)(tail - line), &lookahead)) {
+        MB_PTR_ADV(tail);
+      }
+      if (*tail == NUL) {
+        ptr = tail;
+      }
+    }
     // At end of screen line and there is more to come: Display the line
     // so far.  If there is no more to display it is caught above.
     if (wlv.col >= view_width && (!has_foldtext || wlv.filler_todo > 0)

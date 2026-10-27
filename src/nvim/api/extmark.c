@@ -512,6 +512,13 @@ ArrayOf(DictAs(get_extmark_item)) nvim_buf_get_extmarks(Buffer buf, Integer ns_i
 ///                   When a character is supplied it is used as |:syn-cchar|.
 ///                   "hl_group" is used as highlight for the cchar if provided,
 ///                   otherwise it defaults to |hl-Conceal|.
+///               - conceal_compact: boolean (local native extension, detectable
+///                   with `has('conceal_compact')`). With empty "conceal", make
+///                   the range zero-width for wrapping, screen coordinates and
+///                   mouse hit testing. Requires a nonempty persistent range.
+///                   Active at 'conceallevel' 2 or 3, subject to 'concealcursor'
+///                   and Visual selection. Does not change buffer text. Legacy
+///                   conceal behavior is unchanged when false or omitted.
 ///               - conceal_lines: string which should be empty. When
 ///                   provided, lines in the range are not drawn at all
 ///                   (according to 'conceallevel'); the next unconcealed line
@@ -642,6 +649,15 @@ Integer nvim_buf_set_extmark(Buffer buf, Integer ns_id, Integer line, Integer co
         goto error;
       });
     }
+  }
+
+  if (opts->conceal_compact) {
+    VALIDATE(HAS_KEY(opts, set_extmark, conceal) && opts->conceal.size == 0
+             && !opts->ephemeral, "%s",
+             "conceal_compact requires empty conceal and a persistent extmark", {
+      goto error;
+    });
+    hl.flags |= kSHConcealCompact;
   }
 
   if (HAS_KEY(opts, set_extmark, conceal_lines)) {
@@ -832,6 +848,13 @@ Integer nvim_buf_set_extmark(Buffer buf, Integer ns_id, Integer line, Integer co
     col2 = 0;
   }
 
+  if (opts->conceal_compact) {
+    VALIDATE(line2 > line || (line2 == line && col2 > col), "%s",
+             "conceal_compact requires a nonempty range", {
+      goto error;
+    });
+  }
+
   if (opts->ephemeral && decor_state.win && decor_state.win->w_buffer == b) {
     int r = (int)line;
     int c = (int)col;
@@ -933,6 +956,9 @@ Integer nvim_buf_set_extmark(Buffer buf, Integer ns_id, Integer line, Integer co
       decor_flags |= MT_FLAG_DECOR_HL;
     }
 
+    if (opts->conceal_compact) {
+      b->b_has_compact_conceal = true;
+    }
     extmark_set(b, (uint32_t)ns_id, &id, (int)line, (colnr_T)col, line2, col2,
                 decor, decor_flags, right_gravity, opts->end_right_gravity,
                 !GET_BOOL_OR_TRUE(opts, set_extmark, undo_restore),

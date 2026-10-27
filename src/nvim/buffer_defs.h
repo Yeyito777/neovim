@@ -740,6 +740,7 @@ struct file_buffer {
   int b_mapped_ctrl_c;          // modes where CTRL-C is mapped
 
   MarkTree b_marktree[1];
+  bool b_has_compact_conceal;  ///< Fast negative check; sticky once used in this buffer.
   Map(uint32_t, uint32_t) b_extmark_ns[1];         // extmark namespaces
 
   // Store the line count as it was before appending or inserting lines.

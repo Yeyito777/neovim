@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -56,7 +57,7 @@ int getviscol2(colnr_T col, colnr_T coladd)
 /// The caller must have saved the cursor line for undo!
 int coladvance_force(colnr_T wcol)
 {
-  int rc = coladvance2(curwin, &curwin->w_cursor, true, false, wcol);
+  int rc = coladvance2(curwin, &curwin->w_cursor, true, false, wcol, INT_MIN);
 
   if (wcol == MAXCOL) {
     curwin->w_valid &= ~VALID_VIRTCOL;
@@ -87,10 +88,29 @@ int coladvance(win_T *wp, colnr_T wcol)
   return rc;
 }
 
+/// Like coladvance(), but use compact-conceal geometry captured when the
+/// target screen cell was drawn.  Moving the cursor can otherwise reveal the
+/// line through 'concealcursor' before its screen column is converted.
+///
+/// @param compact_row  zero-based row to force compact geometry for, or -1 to
+///                     force normal geometry
+int coladvance_with_compact(win_T *wp, colnr_T wcol, int compact_row)
+{
+  int rc = coladvance2(wp, &wp->w_cursor, false, virtual_active(wp), wcol, compact_row);
+
+  if (wcol == MAXCOL || rc == FAIL) {
+    wp->w_valid &= ~VALID_VIRTCOL;
+  } else if (*(ml_get_buf(wp->w_buffer, wp->w_cursor.lnum) + wp->w_cursor.col) != TAB) {
+    set_valid_virtcol(wp, wcol);
+  }
+  return rc;
+}
+
 /// @param addspaces  change the text to achieve our goal? only for wp=curwin!
 /// @param finetune  change char offset for the exact column
 /// @param wcol_arg  column to move to (can be negative)
-static int coladvance2(win_T *wp, pos_T *pos, bool addspaces, bool finetune, colnr_T wcol_arg)
+static int coladvance2(win_T *wp, pos_T *pos, bool addspaces, bool finetune, colnr_T wcol_arg,
+                       int compact_row)
 {
   assert(wp == curwin || !addspaces);
   colnr_T wcol = wcol_arg;
@@ -126,7 +146,22 @@ static int coladvance2(win_T *wp, pos_T *pos, bool addspaces, bool finetune, col
         && wp->w_view_width != 0
         && wcol >= (colnr_T)width
         && width > 0) {
-      csize = linetabsize_eol(wp, pos->lnum);
+      if (compact_row == INT_MIN) {
+        csize = linetabsize_eol(wp, pos->lnum);
+      } else {
+        CharsizeArg sizearg;
+        CSType sizetype = init_charsize_arg(&sizearg, wp, pos->lnum, line);
+        sizearg.compact_row = compact_row;
+        if (compact_row >= 0) {
+          sizetype = kCharsizeRegular;
+        }
+        csize = sizetype == kCharsizeFast
+                ? linesize_fast(&sizearg, 0, MAXCOL)
+                : linesize_regular(&sizearg, 0, MAXCOL);
+        if (wp->w_p_list && wp->w_p_lcs_chars.eol != NUL) {
+          csize++;
+        }
+      }
       if (csize > 0) {
         csize--;
       }
@@ -143,6 +178,12 @@ static int coladvance2(win_T *wp, pos_T *pos, bool addspaces, bool finetune, col
 
     CharsizeArg csarg;
     CSType cstype = init_charsize_arg(&csarg, wp, pos->lnum, line);
+    if (compact_row != INT_MIN) {
+      csarg.compact_row = compact_row;
+      if (compact_row >= 0) {
+        cstype = kCharsizeRegular;
+      }
+    }
     StrCharInfo ci = utf_ptr2StrCharInfo(line);
     col = 0;
     while (col <= wcol && *ci.ptr != NUL) {
@@ -251,7 +292,7 @@ static int coladvance2(win_T *wp, pos_T *pos, bool addspaces, bool finetune, col
 /// @return  OK if desired column is reached, FAIL if not
 int getvpos(win_T *wp, pos_T *pos, colnr_T wcol)
 {
-  return coladvance2(wp, pos, false, virtual_active(wp), wcol);
+  return coladvance2(wp, pos, false, virtual_active(wp), wcol, INT_MIN);
 }
 
 /// Increment the cursor position.  See inc() for return values.

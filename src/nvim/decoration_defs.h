@@ -56,6 +56,7 @@ enum {
   kSHSpellOff = 32,
   kSHConceal = 64,
   kSHConcealLines = 128,
+  kSHConcealCompact = 256,
 };
 
 typedef struct {
