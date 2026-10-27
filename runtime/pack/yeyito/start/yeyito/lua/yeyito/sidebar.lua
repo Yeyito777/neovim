@@ -171,6 +171,11 @@ end
 
 local INDEX_MAX = 50000 -- entries, in a folder that isn't a git repository
 local SLICE = 8e6 -- ns of index work per turn of the main loop
+local SCANS = 4 -- folders being listed at once, off the main thread
+local SCAN_TIMEOUT = 2000 -- ms a folder may take to list before it is skipped
+-- Not searched into: macOS's app data, hidden by Finder. Other apps' folders
+-- in it (Group Containers) can block whoever lists them indefinitely.
+local SKIP = uv.os_uname().sysname == "Darwin" and uv.os_homedir() .. "/Library" or nil
 
 local index_ready ---@type fun()
 
@@ -210,13 +215,16 @@ local function from_git(out, kids, check)
 end
 
 --- Outside a repository: the folders breadth first, so with more than
---- INDEX_MAX entries the ones nearest the root are the ones kept.
-local function walk(dir, kids, check)
-  local queue, head, count = { "" }, 1, 0
-  while queue[head] and count < INDEX_MAX do
-    local rel = queue[head]
-    head = head + 1
-    local handle = uv.fs_scandir(rel == "" and dir or dir .. "/" .. rel)
+--- INDEX_MAX entries the ones nearest the root are the ones kept. They are
+--- listed off the main thread, SCANS at a time, so a folder that is slow to
+--- open (on a network or in the cloud) never blocks the editor: after
+--- SCAN_TIMEOUT it is skipped. `done` runs once it is all in `kids`.
+local function walk(job, kids, done)
+  local dir = job.root
+  local prefix = dir == "/" and "/" or dir .. "/"
+  local queue, head, count, busy, finished = { "" }, 1, 0, 0, false
+  local next_folders
+  local function list(rel, handle)
     while handle and count < INDEX_MAX do
       local name, kind = uv.fs_scandir_next(handle)
       if not name then
@@ -226,18 +234,52 @@ local function walk(dir, kids, check)
         local path = rel == "" and name or rel .. "/" .. name
         local is_dir = kind == "directory"
         if kind ~= "directory" and kind ~= "file" then -- a link, or a filesystem that doesn't say
-          local stat = uv.fs_stat(dir .. "/" .. path)
+          local stat = uv.fs_stat(prefix .. path)
           is_dir = stat ~= nil and stat.type == "directory"
         end
         add_kid(kids, rel, name, is_dir)
         count = count + 1
-        if is_dir and kind ~= "link" then -- not into linked folders: they can loop
+        -- Not into linked folders: they can loop.
+        if is_dir and kind ~= "link" and prefix .. path ~= SKIP then
           queue[#queue + 1] = path
         end
       end
-      check()
     end
   end
+  next_folders = function()
+    if search.job ~= job or finished then
+      return
+    end
+    while busy < SCANS and queue[head] and count < INDEX_MAX do
+      local rel = queue[head]
+      head = head + 1
+      busy = busy + 1
+      local settled = false
+      local timer = uv.new_timer()
+      timer:start(SCAN_TIMEOUT, 0, function()
+        timer:close()
+        if not settled then
+          settled, busy = true, busy - 1
+          next_folders()
+        end
+      end)
+      uv.fs_scandir(prefix .. rel, function(_, handle)
+        if settled then
+          return -- too late: skipped
+        end
+        settled, busy = true, busy - 1
+        timer:stop()
+        timer:close()
+        list(rel, handle)
+        next_folders()
+      end)
+    end
+    if busy == 0 and (not queue[head] or count >= INDEX_MAX) then
+      finished = true
+      vim.schedule(done)
+    end
+  end
+  next_folders()
 end
 
 --- The entries in tree order: each folder's contents sorted as the tree
@@ -286,18 +328,17 @@ local function start_index()
   end
   local job = { root = root }
   search.job = job
+  local kids = {}
   local deadline = 0
   local function check()
     if uv.hrtime() > deadline then
       coroutine.yield()
     end
   end
+  -- In slices on the main loop: git's list into folders, then tree order.
   local co = coroutine.create(function(git_out)
-    local kids = {}
     if git_out then
       from_git(git_out, kids, check)
-    else
-      walk(job.root, kids, check)
     end
     return emit(job.root, kids, check)
   end)
@@ -318,14 +359,21 @@ local function start_index()
       index_ready()
     end
   end
+  local function no_git()
+    walk(job, kids, resume)
+  end
   local cmd = { "git", "-C", job.root, "ls-files", "-z", "--cached", "--others", "--exclude-standard" }
   local ok = pcall(vim.system, cmd, {}, function(res)
     vim.schedule(function()
-      resume(res.code == 0 and (res.stdout or "") or nil)
+      if res.code == 0 then
+        resume(res.stdout or "")
+      elseif search.job == job then
+        no_git()
+      end
     end)
   end)
   if not ok then -- no git
-    vim.schedule(resume)
+    vim.schedule(no_git)
   end
 end
 

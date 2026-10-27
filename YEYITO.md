@@ -159,9 +159,11 @@ Like Exocortex's sidebar it has its own command line, in its bottom row
   (shown as `/text` in the bottom row), Esc or Backspace on an empty bar goes
   back. In a git repository it searches what git sees (tracked and untracked,
   not ignored); elsewhere every folder but `.git`, nearest first, up to 50,000
-  files and folders (a home directory has far more).
-- The list of the project's files is built in the background, in slices
-  between keystrokes, so even a home directory never freezes the editor:
+  files and folders (a home directory has far more), not inside macOS's
+  `~/Library` (other apps' containers there can block whoever lists them).
+- The list of the project's files is built in the background (folders are
+  listed off the main thread; one that takes over 2 s is skipped), so even a
+  home directory never freezes the editor:
   while the first one builds the list says `searching…`, and Enter or `n`
   typed meanwhile select their match when it lands. Each `/` rebuilds it
   (the project may have changed), searching the last one until then.

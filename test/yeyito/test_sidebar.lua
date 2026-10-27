@@ -219,6 +219,9 @@ local function search_steps()
     for _, f in ipairs({ "README.md", "docs/guide.md", "new\nline.txt" }) do
       vim.fn.writefile({ "x" }, dir .. "/" .. f)
     end
+    S.locked = dir .. "/locked" -- can't be listed: the search goes on without it
+    vim.fn.mkdir(S.locked)
+    vim.uv.fs_chmod(S.locked, 0)
     vim.cmd("tabnew")
     vim.cmd.cd(dir)
     vim.cmd.edit("README.md")
@@ -231,6 +234,7 @@ local function search_steps()
     check("a newline in a name shows as ?", vim.tbl_contains(S.tree, "  new?line.txt"), S.tree)
     check("Enter before the index is built: the match once it lands", vim.deep_equal(lines(), { "  docs/guide.md" })
       and selected() == "docs/guide.md", { lines(), selected() })
+    vim.uv.fs_chmod(S.locked, 448) -- 0700, so Nvim can delete its temp dir
     vim.cmd("tabclose")
   end)
   return steps
