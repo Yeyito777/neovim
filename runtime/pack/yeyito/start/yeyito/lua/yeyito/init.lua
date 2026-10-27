@@ -6,6 +6,7 @@ local M = {}
 function M.setup()
   require("yeyito.colors").setup() -- color level, 'termguicolors', theme
   require("yeyito.options").setup() -- leader, options, diagnostics display
+  require("yeyito.treesitter").setup() -- was nvim-treesitter
   require("yeyito.markdown_refresh").setup()
   require("yeyito.persist_local_marks")
   require("yeyito.keymaps").setup()
