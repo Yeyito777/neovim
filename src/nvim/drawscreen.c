@@ -1668,7 +1668,7 @@ static void win_update(win_T *wp)
         j = 0;
         for (linenr_T ln = wp->w_topline; ln < wp->w_lines[0].wl_lnum; ln++) {
           j += !decor_conceal_line(wp, ln - 1, false);
-          if (j >= wp->w_view_height - 2) {
+          if (j >= wp->w_view_height - 1) {
             break;
           }
           hasFolding(wp, ln, NULL, &ln);
@@ -1676,13 +1676,15 @@ static void win_update(win_T *wp)
       } else {
         j = wp->w_lines[0].wl_lnum - wp->w_topline;
       }
-      if (j < wp->w_view_height - 2) {               // not too far off
+      // Scroll when at least one row stays: a page back (CTRL-B, h-2 rows)
+      // scrolls like a page forward does, which a terminal can animate.
+      if (j < wp->w_view_height - 1) {               // not too far off
         int i = plines_m_win(wp, wp->w_topline, wp->w_lines[0].wl_lnum - 1, wp->w_view_height);
         // insert extra lines for previously invisible filler lines
         if (wp->w_lines[0].wl_lnum != wp->w_topline) {
           i += win_get_fill(wp, wp->w_lines[0].wl_lnum) - wp->w_old_topfill;
         }
-        if (i != 0 && i < wp->w_view_height - 2) {  // less than a screen off
+        if (i != 0 && i < wp->w_view_height - 1) {  // less than a screen off
           // Try to insert the correct number of lines.
           // If not the last window, delete the lines at the bottom.
           // win_ins_lines may fail when the terminal can't do it.
