@@ -11,6 +11,11 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
 - **`$NVIM_NOTTYFAST`** (C, backport of upstream 66149ca): skips the blocking
   terminal-background probe over slow SSH. `.zshrc` sets it for SSH sessions.
   Drop the commit when rebasing onto a release that already includes it.
+- **Smooth scrolling in st** (C, `src/nvim/tui/tui.c` `glide_*`): on a
+  terminal with st's app-driven smooth scrolling (mode 2032) a window's view
+  scroll glides into place instead of jumping. Also `drawscreen.c`: a page
+  back (CTRL-B) region-scrolls like a page forward does, so it glides too.
+  See [Smooth scrolling](#smooth-scrolling).
 - **Bundled parsers**: python cpp java bash javascript typescript tsx html css
   rust, besides upstream's c lua vim vimdoc query markdown
   (`cmake.deps/deps.txt`, pinned to nvim-treesitter's lockfile).
@@ -51,6 +56,8 @@ that aren't installed are skipped silently.
 | `statusline.lua` | The lualine look, cell for cell (was lualine.nvim). |
 | `indent_guides.lua` | Indent guides (was indent-blankline.nvim). |
 | `marks.lua` | Marks in the sign column + marks.nvim's mappings and bookmarks. |
+| `smoothscroll.lua` | Marks which redraws are view scrolls, for the TUI to glide. |
+| `sidebar.lua` | The Ctrl+S file sidebar. |
 | `markdown_links.lua`, `markdown_refresh.lua`, `strikethrough.lua`, `persist_local_marks.lua` | My Markdown and marks tools. |
 | `queries/` | Highlight/indent/textobject queries for the bundled languages. |
 | `overrides/queries/` | Replacements for built-in queries (Markdown); see its README. |
@@ -72,6 +79,63 @@ with two builds and diff the screens cell by cell (colors included):
 Machine-local tweaks, if ever needed, go in `~/.config/nvim/after/plugin/*.lua`
 (it runs after the built-in config; a plain `~/.config/nvim/init.lua` runs
 before it and gets overridden).
+
+## Smooth scrolling
+
+The Exocortex TUI's smooth scrolling, in Neovim. When st supports it (DECRQM
+`CSI ? 2032 $ p`, see `~/Config/st/docs/app-smooth-scroll.md`), the TUI turns
+st's app-driven smooth scrolling on. A window whose view scrolls is then drawn
+where its content was and eases into place over 100 ms, timed by st at the
+display's refresh rate; inputs mid-glide add up, so holding CTRL-E or spinning
+the wheel moves continuously. Nothing is sent between frames, so it stays
+smooth over SSH.
+
+What glides: the wheel and trackpad, CTRL-E/Y/D/U/F/B, `j`/`k` at the window
+edge, `zz`/`zt`/`zb`, `n`/`N` and other jumps within a screen, typing past the
+bottom, terminal output while following it. What doesn't: lines moving
+because of an edit (`dd`, `o`, a paste), and jumps further than a screen
+(`gg`, `G`), which are drawn in place. A window beside a split (the sidebar)
+glides too: st has no left/right margins, so its rows scroll across the whole
+width and the other windows' columns are drawn again in the same frame.
+
+How: `smoothscroll.lua` sends the TUI a marker (`nvim_ui_send`, never written
+to the terminal) from `WinScrolled`, which fires just before the redraw. The
+TUI then glides the region scroll of that window's text area: after the
+scroll, in the same synchronized update, it declares the window as st's moving
+rectangle (`OSC 2032 ; r`) and starts an easing term (`OSC 2032 ; m ; 0 ; ROWS*1000
+; 100`). st draws the strip the shifted window uncovers from the lines its
+scroll pushed out. A window that moved without a region scroll (it was
+redrawn) stops any glide (`OSC 2032 ; o ; 0`). Other terminals, tmux and
+`nvim --clean` are unaffected.
+
+Tests: `python3 test/yeyito/test_smooth_scroll.py` runs the real TUI against a
+fake st on a PTY and checks each frame's bytes. In a real st,
+`ST_SMOOTHSCROLL_LOG=file` logs the offset of every frame drawn.
+
+## File sidebar (Ctrl+S)
+
+The Exocortex sidebar, for files: the working directory as a tree on the
+left, 28 columns with its border, in Exocortex's colors.
+
+- **Ctrl+S** (normal, visual and insert mode): open it focused, on the current
+  file (its folders opened), or close it back to the editor.
+- **Tab**: switch focus between it and the editor while it is open (otherwise
+  Tab is CTRL-I as usual). The border is blue while the sidebar has focus.
+- In the sidebar: `j`/`k` move; **Enter**, `l` or a click opens a file in the
+  editor (focus stays in the sidebar, as in Exocortex) or opens/closes a
+  folder; `h`/Backspace closes the folder; `i`/`a` go back to the editor; `q`
+  closes it; `R` reloads.
+- It follows the filesystem: open folders are watched, so files created by the
+  shell or an agent show up by themselves. `.git` is hidden; dotfiles show.
+- The editor's current file is bold. `:q` in the last editor window quits
+  rather than leaving the sidebar alone.
+
+Unlike Exocortex it does not reopen at startup (`nvim` is also the
+commit-message and scratch editor). Ctrl+S in insert mode replaces 0.12's
+default LSP signature help there.
+
+Tests: `VIMRUNTIME=runtime build/bin/nvim --headless -u NORC -c 'luafile
+test/yeyito/test_sidebar.lua'`.
 
 ## Markdown links
 
