@@ -40,6 +40,11 @@ local function refresh(buf, force)
   if not api.nvim_buf_is_loaded(buf) then
     return
   end
+  -- Files only: not the sidebar, ui2's cmdline/pager, help or terminals, where
+  -- a sign for the last change ('.') would just push the text aside.
+  if vim.bo[buf].buftype ~= "" then
+    return
+  end
   local marks = letter_marks(buf)
   for _, m in ipairs(BUILTIN) do
     local ok, pos = pcall(api.nvim_buf_get_mark, buf, m)
