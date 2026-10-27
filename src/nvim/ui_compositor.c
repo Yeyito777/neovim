@@ -668,6 +668,25 @@ static bool curgrid_covered_above(int row)
   return kv_size(layers) - (above_msg ? 1 : 0) > curgrid->comp_index + 1;
 }
 
+/// Check if a grid above curgrid overlaps rows [top, bot), columns [left, right).
+static bool curgrid_covered_rect(int top, int bot, int left, int right)
+{
+  for (size_t i = curgrid->comp_index + 1; i < kv_size(layers); i++) {
+    ScreenGrid *g = kv_A(layers, i);
+    int g_top = g->comp_row;
+    int g_bot = g->comp_row + g->rows;
+    if (g == &msg_grid) {
+      // Only the rows messages are shown in, as curgrid_covered_above().
+      g_top = msg_current_row - (msg_was_scrolled ? 1 : 0);
+      g_bot = Rows;
+    }
+    if (g_top < bot && g_bot > top && g->comp_col < right && g->comp_col + g->cols > left) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, Integer right,
                          Integer rows, Integer cols)
 {
@@ -678,11 +697,12 @@ void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, I
   bot += curgrid->comp_row;
   left += curgrid->comp_col;
   right += curgrid->comp_col;
-  bool covered = curgrid_covered_above((int)(bot - MAX(rows, 0)));
+  // Only a grid over the scrolled area itself prevents scrolling it: a float
+  // elsewhere on screen (a cmdline window, a sidebar's foot) does not.
+  bool covered = curgrid_covered_rect((int)top, (int)bot, (int)left, (int)right);
 
   if (covered || curgrid->blending) {
     // TODO(bfredl):
-    // 1. check if rectangles actually overlap
     // 2. calculate subareas that can scroll.
     compose_debug(top, bot, left, right, dbghl_recompose, true);
     for (int r = (int)(top + MAX(-rows, 0)); r < bot - MAX(rows, 0); r++) {
