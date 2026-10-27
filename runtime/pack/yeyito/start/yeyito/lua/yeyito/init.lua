@@ -8,6 +8,7 @@ function M.setup()
   require("yeyito.options").setup() -- leader, options, diagnostics display
   require("yeyito.treesitter").setup() -- was nvim-treesitter
   require("yeyito.textobjects").setup() -- was nvim-treesitter-textobjects
+  require("yeyito.lsp").setup() -- was nvim-lspconfig
   require("yeyito.markdown_refresh").setup()
   require("yeyito.persist_local_marks")
   require("yeyito.keymaps").setup()
