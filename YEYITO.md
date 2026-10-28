@@ -86,6 +86,14 @@ nvim-lspconfig 107c245 (`lua/yeyito/servers/`) (all Apache-2.0).
 Edit the files, then `./install.sh` (Lua-only changes rebuild in seconds). To
 try a change without installing: `VIMRUNTIME=$PWD/runtime build/bin/nvim`.
 
+Where new code goes: Lua, in this package, by default. C only where it
+clearly wins: something Lua can't reach (the TUI's smooth scrolling, the
+compositor), or a hot path measured to cost real time. A C bug crashes the
+editor, every C patch can conflict with the next Neovim release, and each
+change needs a rebuild. Measured Oct 2026, none of the Lua was worth moving:
+indent guides add 0.3 ms to a full redraw, and the freezes found were
+blocking calls, which C would not have avoided.
+
 To check that a change doesn't alter how things look, render the same file
 with two builds and diff the screens cell by cell (colors included):
 `test/yeyito/screendiff/shot.sh ~/.local/bin/nvim app.py before.txt`, then
