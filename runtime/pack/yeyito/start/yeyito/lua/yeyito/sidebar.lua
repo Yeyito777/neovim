@@ -988,9 +988,7 @@ local function close_bar(cancel)
   end
   local side = sidebar_win()
   if side then
-    -- Back where it was opened from: Ctrl+P from the editor returns there.
-    local origin = b.origin and api.nvim_win_is_valid(b.origin) and b.origin or side
-    api.nvim_set_current_win(origin)
+    api.nvim_set_current_win(side)
     render(cancel and b.saved and b.saved.path or nil)
   end
   update_foot()
@@ -1070,13 +1068,6 @@ local function submit_bar()
   end
   local b = bar
   local input = api.nvim_buf_get_lines(b.buf, 0, 1, false)[1] or ""
-  if b.mode == "input" then -- a name for a file operation
-    close_bar(false)
-    vim.schedule(function()
-      b.on_submit(input)
-    end)
-    return
-  end
   if b.mode == "command" then
     close_bar(false)
     -- After the bar's insert mode has ended: leaving it clears the command
@@ -1100,36 +1091,20 @@ local function submit_bar()
   update_foot()
 end
 
---- Open the sidebar's command line in its bottom row: "search" (/ or ?),
---- "command" (:) or "input": `opts` = { label ("Rename"), text (to start
---- from), placeholder, on_submit(text), complete(text) -> candidates for Tab,
---- origin (the window to go back to) }.
-function M.open_bar(mode, direction, opts)
+--- Open the sidebar's command line in its bottom row: "search" (/ or ?) or "command" (:).
+function M.open_bar(mode, direction)
   local side = sidebar_win()
   if not side then
     return
   end
   close_bar(true)
-  opts = opts or {}
   if mode == "search" then
     start_index() -- the project may have changed since the last search
   end
   local b = api.nvim_create_buf(false, true)
   vim.bo[b].bufhidden = "wipe"
-  bar = {
-    mode = mode,
-    direction = direction or search.direction,
-    saved = selected_entry(),
-    buf = b,
-    showmode = vim.o.showmode,
-    on_submit = opts.on_submit,
-    origin = opts.origin,
-  }
-  local prompt = mode == "input" and opts.label .. ":" or mode == "command" and ":"
-    or (bar.direction == "forward" and "/" or "?")
-  if opts.text then
-    api.nvim_buf_set_lines(b, 0, -1, false, { opts.text })
-  end
+  bar = { mode = mode, direction = direction or search.direction, saved = selected_entry(), buf = b, showmode = vim.o.showmode }
+  local prompt = mode == "command" and ":" or (bar.direction == "forward" and "/" or "?")
   bar.win = api.nvim_open_win(b, true, {
     relative = "editor",
     row = vim.o.lines - 1,
@@ -1154,7 +1129,7 @@ function M.open_bar(mode, direction, opts)
     local empty = (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
     if empty and not placeholder then
       placeholder = api.nvim_buf_set_extmark(b, pns, 0, 0, {
-        virt_text = { { opts.placeholder or (mode == "command" and "command" or "search"), "YeyitoSidebarPlaceholder" } },
+        virt_text = { { mode == "command" and "command" or "search", "YeyitoSidebarPlaceholder" } },
         virt_text_pos = "eol",
       })
     elseif not empty and placeholder then
@@ -1192,30 +1167,7 @@ function M.open_bar(mode, direction, opts)
     end
     return "<BS>"
   end, { expr = true })
-  -- Tab / Shift+Tab: the candidates for what is typed, in turn.
-  local cycle ---@type { items: string[], i: integer }?
-  local function complete(step)
-    if not opts.complete then
-      return
-    end
-    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
-    if not (cycle and cycle.items[cycle.i] == text) then
-      cycle = { items = opts.complete(text), i = 0 }
-    end
-    if #cycle.items == 0 then
-      return
-    end
-    cycle.i = cycle.i == 0 and (step > 0 and 1 or #cycle.items) or (cycle.i - 1 + step) % #cycle.items + 1
-    local pick = cycle.items[cycle.i]
-    api.nvim_buf_set_lines(b, 0, 1, false, { pick })
-    api.nvim_win_set_cursor(bar.win, { 1, #pick })
-  end
-  imap("<Tab>", function()
-    complete(1)
-  end)
-  imap("<S-Tab>", function()
-    complete(-1)
-  end)
+  imap("<Tab>", "")
   imap("<C-s>", function()
     close_bar(true)
     M.close()
@@ -1234,7 +1186,7 @@ function M.open_bar(mode, direction, opts)
   -- The bar's insert mode is not the editor's: no "-- INSERT --" beside it.
   vim.o.showmode = false
   update_foot()
-  vim.cmd.startinsert({ bang = opts.text ~= nil }) -- after the text it starts from
+  vim.cmd.startinsert()
 end
 
 --- n / N: the next / previous match of the last search (shows the filter again).
@@ -1455,8 +1407,170 @@ local function undo(redo)
   vim.notify((redo and "Redo: " or "Undo: ") .. op.label)
 end
 
+-- ── Name prompt: a box in the middle of the editor, as Exocortex's ───────
+
+local modal ---@type { frame: integer, input: integer, origin: integer, showmode: boolean }?
+local modal_ns = api.nvim_create_namespace("yeyito.sidebar.modal")
+
+local function close_modal()
+  local m = modal
+  modal = nil
+  if not m then
+    return
+  end
+  vim.cmd.stopinsert()
+  for _, win in ipairs({ m.input, m.frame }) do
+    if api.nvim_win_is_valid(win) then
+      api.nvim_win_close(win, true)
+    end
+  end
+  vim.o.showmode = m.showmode
+  if api.nvim_win_is_valid(m.origin) then
+    api.nvim_set_current_win(m.origin)
+  end
+end
+
+--- Ask for a name in a box in the middle of the editor, Exocortex's
+--- overlay: its title, a line for what went wrong, and the text to type.
+--- Enter submits, Esc cancels. `opts` = { title, text (to start from),
+--- placeholder, error, complete(text) -> candidates for Tab,
+--- on_submit(text) -> nil when done, or why not: it asks again with that }.
+local function prompt(opts)
+  close_modal()
+  local origin = api.nvim_get_current_win()
+  -- Centred in the editor's part of the screen, right of the sidebar.
+  local left = sidebar_win() and WIDTH or 0
+  local area = vim.o.columns - left
+  local width = math.max(20, math.min(56, area - 4))
+  local row = math.max(0, math.floor((vim.o.lines - 5) / 2))
+  local col = left + math.max(0, math.floor((area - width - 2) / 2))
+  local fbuf = api.nvim_create_buf(false, true)
+  vim.bo[fbuf].bufhidden = "wipe"
+  local title = " " .. opts.title
+  api.nvim_buf_set_lines(fbuf, 0, -1, false, { title, opts.error and " " .. opts.error or "", "" })
+  if opts.error then
+    api.nvim_buf_set_extmark(fbuf, modal_ns, 1, 0, { end_row = 2, hl_group = "YeyitoSidebarDelete" })
+  end
+  api.nvim_buf_set_extmark(fbuf, modal_ns, 2, 0, { line_hl_group = "YeyitoSidebarField" })
+  local border = { "┌", "─", "┐", "│", "┘", "─", "└", "│" }
+  local frame = api.nvim_open_win(fbuf, false, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = width,
+    height = 3,
+    style = "minimal",
+    border = border,
+    focusable = false,
+    zindex = 220,
+    noautocmd = true,
+  })
+  vim.wo[frame].winhighlight = "Normal:YeyitoSidebarMenu,FloatBorder:YeyitoSidebarMenuBorder"
+  -- The text field: its own window on the box's last line.
+  local b = api.nvim_create_buf(false, true)
+  vim.bo[b].bufhidden = "wipe"
+  if opts.text then
+    api.nvim_buf_set_lines(b, 0, -1, false, { opts.text })
+  end
+  local input = api.nvim_open_win(b, true, {
+    relative = "editor",
+    row = row + 3,
+    col = col + 2,
+    width = width - 2,
+    height = 1,
+    style = "minimal",
+    zindex = 221,
+    noautocmd = true,
+  })
+  vim.wo[input].winhighlight = "Normal:YeyitoSidebarField"
+  vim.wo[input].wrap = false
+  vim.wo[input].signcolumn = "no"
+  modal = { frame = frame, input = input, origin = origin, showmode = vim.o.showmode }
+  vim.o.showmode = false -- no "-- INSERT --": it's a text field
+  local placeholder ---@type integer?
+  local function show_placeholder()
+    local empty = (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
+    if empty and not placeholder and opts.placeholder then
+      placeholder = api.nvim_buf_set_extmark(b, modal_ns, 0, 0, {
+        virt_text = { { opts.placeholder, "YeyitoSidebarFieldPlaceholder" } },
+        virt_text_pos = "overlay",
+      })
+    elseif not empty and placeholder then
+      api.nvim_buf_del_extmark(b, modal_ns, placeholder)
+      placeholder = nil
+    end
+  end
+  show_placeholder()
+  api.nvim_buf_attach(b, false, {
+    on_lines = function()
+      vim.schedule(function()
+        if api.nvim_buf_is_valid(b) then
+          show_placeholder()
+        end
+      end)
+    end,
+  })
+  local function imap(lhs, fn)
+    vim.keymap.set("i", lhs, fn, { buffer = b, nowait = true })
+  end
+  imap("<CR>", function()
+    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
+    close_modal()
+    -- Once out of the text field's insert mode.
+    vim.schedule(function()
+      local err = opts.on_submit(text)
+      if err then
+        prompt(vim.tbl_extend("force", opts, { text = text, error = err }))
+      end
+    end)
+  end)
+  imap("<Esc>", close_modal)
+  imap("<C-c>", close_modal)
+  -- Tab / Shift+Tab: the candidates for what is typed, in turn.
+  local cycle ---@type { items: string[], i: integer }?
+  local function complete(step)
+    if not opts.complete then
+      return
+    end
+    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
+    if not (cycle and cycle.items[cycle.i] == text) then
+      cycle = { items = opts.complete(text), i = 0 }
+    end
+    if #cycle.items == 0 then
+      return
+    end
+    cycle.i = cycle.i == 0 and (step > 0 and 1 or #cycle.items) or (cycle.i - 1 + step) % #cycle.items + 1
+    local pick = cycle.items[cycle.i]
+    api.nvim_buf_set_lines(b, 0, 1, false, { pick })
+    api.nvim_win_set_cursor(input, { 1, #pick })
+  end
+  imap("<Tab>", function()
+    complete(1)
+  end)
+  imap("<S-Tab>", function()
+    complete(-1)
+  end)
+  -- A click elsewhere cancels it.
+  api.nvim_create_autocmd("WinLeave", {
+    buffer = b,
+    once = true,
+    callback = function()
+      vim.schedule(function()
+        if modal and modal.input == input then
+          close_modal()
+        end
+      end)
+    end,
+  })
+  vim.cmd.startinsert({ bang = true }) -- after the text it starts from
+end
+
+local function in_folder(dir)
+  return dir == root and "" or " in " .. rel(dir) .. "/"
+end
+
 --- Create the file (or folder: a name ending in /) `input` names in `dir`;
---- a file opens in the editor, which gets the focus.
+--- a file opens in the editor, which gets the focus. Returns why not.
 local function create(dir, input, as_dir)
   input = vim.trim(input)
   if input == "" then
@@ -1466,7 +1580,7 @@ local function create(dir, input, as_dir)
   local path = path_in(dir, input)
   local ok, err = files.create(path, is_dir)
   if not ok then
-    return fail(err)
+    return err
   end
   if is_dir then
     expanded[path] = true
@@ -1482,56 +1596,48 @@ local function create(dir, input, as_dir)
   end
 end
 
-local function folder_placeholder(what, dir)
-  return dir == root and what or "in " .. rel(dir) .. "/"
-end
-
-local function new_file_in(dir, origin)
-  M.open_bar("input", nil, {
-    label = "File",
-    placeholder = folder_placeholder("name", dir),
-    origin = origin,
+local function new_file_in(dir)
+  prompt({
+    title = "New file" .. in_folder(dir),
+    placeholder = "name (a / at the end: a folder)",
     on_submit = function(input)
-      create(dir, input)
+      return create(dir, input)
     end,
   })
 end
 
 --- Ctrl+P: a new file in the folder under the sidebar's cursor (`top`, as
---- Ctrl+Shift+O: at the top of the project). Without the sidebar, named on
---- the command line, starting from the current file's folder.
+--- Ctrl+Shift+O: at the top of the project). Without the sidebar, in the
+--- current file's folder.
 function M.new_file(top)
-  local side = sidebar_win()
-  if side then
+  if sidebar_win() then
     clear_pending()
     leave_visual()
-    local origin = api.nvim_get_current_win()
-    new_file_in(top and root or cursor_folder(), origin ~= side and origin or nil)
+    new_file_in(top and root or cursor_folder())
     return
   end
   local name = api.nvim_buf_get_name(0)
-  local dir = vim.fn.getcwd()
+  local dir = vim.fs.normalize(vim.fn.getcwd())
   if not top and name ~= "" and vim.bo.buftype == "" then
-    dir = vim.fs.dirname(name)
+    dir = vim.fs.dirname(vim.fs.normalize(name))
   end
-  local start = vim.fn.fnamemodify(dir, ":~:.")
-  vim.ui.input({
-    prompt = "New file: ",
-    default = (start == "" or start == ".") and "" or start .. "/",
-    completion = "file",
-  }, function(input)
-    if input then
-      create(vim.fn.getcwd(), input)
-    end
-  end)
+  local cwd = vim.fs.normalize(vim.fn.getcwd())
+  prompt({
+    title = "New file" .. (dir == cwd and "" or " in " .. vim.fn.fnamemodify(dir, ":~:.") .. "/"),
+    placeholder = "name (a / at the end: a folder)",
+    on_submit = function(input)
+      return create(dir, input)
+    end,
+  })
 end
 
 --- f: a new folder where the cursor is; with rows selected, around them
 --- (they move into it, one u undoes both).
 local function new_folder_in(dir, items)
-  M.open_bar("input", nil, {
-    label = "Folder",
-    placeholder = folder_placeholder("name", dir),
+  prompt({
+    title = (items and #items > 0) and ("New folder for " .. (#items == 1 and vim.fs.basename(items[1].path) or #items .. " items"))
+      or "New folder" .. in_folder(dir),
+    placeholder = "name",
     on_submit = function(input)
       input = vim.trim(input)
       if input == "" then
@@ -1540,7 +1646,7 @@ local function new_folder_in(dir, items)
       local path = path_in(dir, input)
       local ok, err = files.create(path, true)
       if not ok then
-        return fail(err)
+        return err
       end
       expanded[path] = true
       local select = path
@@ -1573,8 +1679,8 @@ local function rename_item(row)
   end
   clear_pending()
   local name = vim.fs.basename(row.path)
-  M.open_bar("input", nil, {
-    label = "Rename",
+  prompt({
+    title = "Rename " .. name,
     text = name,
     placeholder = "name",
     on_submit = function(input)
@@ -1585,14 +1691,14 @@ local function rename_item(row)
       local to = path_in(vim.fs.dirname(row.path), input)
       local ok, err = files.move({ { from = row.path, to = to } }, "rename")
       if not ok then
-        return fail(err)
+        return err
       end
       after_change(to)
     end,
   })
 end
 
---- Folders of the project starting with `text`, for Tab in "Move:".
+--- Folders of the project starting with `text`, for Tab when moving.
 local function complete_folder(text)
   local out = {}
   for _, dir in ipairs(vim.fn.getcompletion(root .. "/" .. text:gsub("^/", ""), "dir")) do
@@ -1610,9 +1716,9 @@ local function move_items(items)
     return
   end
   clear_pending()
-  M.open_bar("input", nil, {
-    label = "Move",
-    placeholder = "folder",
+  prompt({
+    title = "Move " .. (#items == 1 and vim.fs.basename(items[1].path) or #items .. " items") .. " to",
+    placeholder = "folder (Tab completes; empty: the top)",
     complete = complete_folder,
     on_submit = function(input)
       input = vim.trim(input)
@@ -1627,7 +1733,7 @@ local function move_items(items)
       end
       local stat = uv.fs_stat(dest)
       if not (stat and stat.type == "directory") then
-        return fail("No folder " .. rel(dest))
+        return "No folder " .. rel(dest)
       end
       local moves = {}
       for _, item in ipairs(items) do
@@ -1641,7 +1747,7 @@ local function move_items(items)
       end
       local ok, err = files.move(moves, "move")
       if not ok then
-        return fail(err)
+        return err
       end
       after_change(moves[1].to)
     end,
@@ -2064,6 +2170,9 @@ local function highlights()
   set(0, "YeyitoSidebarMenu", { fg = "#ffffff", bg = "#030814" })
   set(0, "YeyitoSidebarMenuSel", { bg = "#0f193c" })
   set(0, "YeyitoSidebarMenuBorder", { fg = "#1d9bf0", bg = "#030814" })
+  -- The name prompt's text field: the selected row's colour, as Exocortex's overlays mark theirs.
+  set(0, "YeyitoSidebarField", { fg = "#ffffff", bg = "#0f193c" })
+  set(0, "YeyitoSidebarFieldPlaceholder", { fg = "#646464", bg = "#0f193c" })
   api.nvim_set_hl(0, "YeyitoSidebarCursor", { blend = 100, bg = "#030814", fg = "#030814" })
 end
 

@@ -278,6 +278,13 @@ local function file_steps()
   local function editor_file()
     return vim.fs.basename(api.nvim_buf_get_name(api.nvim_win_get_buf(S.editor)))
   end
+  local function modal_frame()
+    for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+      if api.nvim_win_get_config(win).zindex == 220 then
+        return win
+      end
+    end
+  end
   local function pending_rows()
     return #api.nvim_buf_get_extmarks(S.buf, api.nvim_create_namespace("yeyito.sidebar.delete"), 0, -1, {})
   end
@@ -450,6 +457,29 @@ local function file_steps()
   end)
   step(function()
     check("Esc closes it", api.nvim_get_current_win() == S.side)
+    select("notes.txt")
+    send("r")
+  end)
+  step(function()
+    local frame = modal_frame()
+    local cfg = frame and api.nvim_win_get_config(frame)
+    local middle = cfg and cfg.col + (cfg.width + 2) / 2
+    check("the name prompt: a box in the middle of the editor, right of the sidebar", cfg ~= nil
+      and math.abs(middle - (28 + (vim.o.columns - 28) / 2)) <= 1
+      and math.abs(cfg.row + 2.5 - vim.o.lines / 2) <= 1
+      and api.nvim_buf_get_lines(api.nvim_win_get_buf(frame), 0, 1, true)[1] == " Rename notes.txt", cfg)
+    send("<C-u>README.md<CR>")
+  end)
+  step(function()
+    local frame = modal_frame()
+    local frame_lines = frame and api.nvim_buf_get_lines(api.nvim_win_get_buf(frame), 0, -1, true) or {}
+    check("a name that exists: asked again, with why and the text kept", api.nvim_get_mode().mode == "i"
+      and api.nvim_get_current_line() == "README.md" and frame_lines[2] == " README.md exists"
+      and exists("notes.txt"), frame_lines)
+    send("<Esc>")
+  end)
+  step(function()
+    check("Esc: gone, back in the sidebar", modal_frame() == nil and api.nvim_get_current_win() == S.side)
     api.nvim_buf_set_lines(api.nvim_win_get_buf(S.editor), 0, -1, true, { "edited" })
     select("notes.txt")
     send("dd")
@@ -460,15 +490,19 @@ local function file_steps()
       vim.cmd("edit!")
     end)
     require("yeyito.sidebar").close()
-    -- No sidebar: Ctrl+P asks on the command line.
-    local ask = vim.ui.input
-    vim.ui.input = function(_, on_confirm)
-      on_confirm("docs/fresh.md")
-    end
-    keys("<C-p>")
-    vim.ui.input = ask
-    check("Ctrl+P without the sidebar: named on the command line", exists("docs/fresh.md")
-      and vim.fs.basename(api.nvim_buf_get_name(0)) == "fresh.md")
+    api.nvim_set_current_win(S.editor)
+    send("<C-p>")
+  end)
+  step(function()
+    local frame = modal_frame()
+    local cfg = frame and api.nvim_win_get_config(frame)
+    check("Ctrl+P without the sidebar: the box in the middle of the screen",
+      cfg ~= nil and math.abs(cfg.col + (cfg.width + 2) / 2 - vim.o.columns / 2) <= 1, cfg)
+    send("docs/fresh.md<CR>")
+  end)
+  step(function()
+    check("and the file opens", exists("docs/fresh.md") and vim.fs.basename(api.nvim_buf_get_name(0)) == "fresh.md",
+      api.nvim_buf_get_name(0))
     require("yeyito.files").trash_root = nil
     vim.fn.delete(S.dir, "rf")
     vim.fn.delete(S.trash, "rf")

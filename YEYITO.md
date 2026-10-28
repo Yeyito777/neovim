@@ -187,8 +187,9 @@ Exocortex's sidebar keys work on files too:
   under the sidebar's cursor (or the selected file's folder); it opens in the
   editor. A name ending in `/` makes a folder. **`Ctrl+Shift+O`**: at the top
   of the project, wherever the cursor is (as in Exocortex; st sends it as
-  `CSI 111;6u`, which Neovim reads as `<C-S-O>`). Without the sidebar, `Ctrl+P` asks on the command line,
-  from the current file's folder. Insert mode's `Ctrl+P` still completes.
+  `CSI 111;6u`, which Neovim reads as `<C-S-O>`). Without the sidebar,
+  `Ctrl+P` makes it in the current file's folder. Insert mode's `Ctrl+P`
+  still completes.
 - **`f`** new folder, **`r`** rename (from the current name), **`c`**
   duplicate (`name copy.ext`), **`F`** move into a folder of the project (Tab
   completes; empty or `/` is the top, `..` one up), **`<`** move out of its
@@ -198,6 +199,10 @@ Exocortex's sidebar keys work on files too:
 - **`;`** or a right click: the actions menu beside the row (Rename,
   Duplicate, Move, Copy path, Delete, which asks "You sure?"; on a folder
   also New file and New folder). `j`/`k`, Enter or a click, Esc.
+- Names (new file, new folder, rename, move) are typed in a box in the
+  middle of the editor, Exocortex's overlay: its title says what and where,
+  Enter does it, Esc cancels. When it can't be done ("main.c exists") the
+  box stays, with why in red and the name kept to fix.
 
 A file with unsaved changes isn't deleted, renamed or moved (save it first);
 open buffers follow a rename or move, with their undo history, and language
