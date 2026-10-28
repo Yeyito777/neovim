@@ -186,7 +186,8 @@ Exocortex's sidebar keys work on files too:
 - **`Ctrl+P`** (from the sidebar or the editor): a new file in the folder
   under the sidebar's cursor (or the selected file's folder); it opens in the
   editor. A name ending in `/` makes a folder. **`Ctrl+Shift+O`**: at the top
-  of the project. Without the sidebar, `Ctrl+P` asks on the command line,
+  of the project, wherever the cursor is (as in Exocortex; st sends it as
+  `CSI 111;6u`, which Neovim reads as `<C-S-O>`). Without the sidebar, `Ctrl+P` asks on the command line,
   from the current file's folder. Insert mode's `Ctrl+P` still completes.
 - **`f`** new folder, **`r`** rename (from the current name), **`c`**
   duplicate (`name copy.ext`), **`F`** move into a folder of the project (Tab

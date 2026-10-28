@@ -125,6 +125,23 @@ def main():
     finally:
         t.close()
 
+    # st sends CSI 111;6u for Ctrl+Shift+O: a new file at the top of the
+    # project, wherever the sidebar's cursor is; Ctrl+P, in the cursor's folder.
+    t, layout, expr = run()
+    try:
+        t.keys(b"\x13")  # CTRL-S: the sidebar, on src/main.c
+        t.keys(b"\t")    # back to the editor
+        t.keys(b"\x10")  # CTRL-P
+        t.keys(b"in_src.txt\r")
+        check("Ctrl+P: a new file in the sidebar cursor's folder",
+              os.path.exists(os.path.join(project, "src", "in_src.txt")) and expr("json_encode(expand('%:.'))") == "src/in_src.txt")
+        t.keys(b"\x1b[111;6u")
+        t.keys(b"at_top.txt\r")
+        check("Ctrl+Shift+O (st's CSI 111;6u): at the top of the project",
+              os.path.exists(os.path.join(project, "at_top.txt")) and expr("json_encode(expand('%:.'))") == "at_top.txt")
+    finally:
+        t.close()
+
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
