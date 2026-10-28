@@ -17,10 +17,20 @@
 --   n N      next/previous match
 --   :        sidebar command: :noh clears the filter and shows the selection in
 --            the tree; anything else runs as an Ex command in the editor
+-- And Exocortex's sidebar keys, for files (see yeyito/files.lua):
+--   dd       delete to the trash: the row turns red, a second d deletes
+--   u C-r    undo / redo the last file operation
+--   Ctrl+P   new file in the folder under the cursor (anywhere: also from the
+--            editor; Ctrl+Shift+O at the top of the project)
+--   f        new folder      r  rename      c  duplicate
+--   F        move to a folder (Tab completes)       <  move out of its folder
+--   v V      select rows: d, F, f (a new folder for them) and < act on them
+--   ;        or a right click: the actions menu
 local M = {}
 
 local api, uv = vim.api, vim.uv
 local colors = require("yeyito.colors")
+local files = require("yeyito.files")
 
 local WIDTH = 28 -- with the border column, as in Exocortex
 local INDENT = "  "
@@ -62,6 +72,17 @@ local bar ---@type table?
 local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer? }
 local foot_ns = api.nvim_create_namespace("yeyito.sidebar.foot")
 local match_ns = api.nvim_create_namespace("yeyito.sidebar.match")
+-- dd: the rows waiting for the second d ({ key, paths }), shown red.
+local pending ---@type { key: string, paths: table<string, true> }?
+local pending_ns = api.nvim_create_namespace("yeyito.sidebar.pending")
+local delete_ns = api.nvim_create_namespace("yeyito.sidebar.delete")
+-- The actions menu (; or a right click) while it is open.
+local menu ---@type { win: integer, buf: integer, items: table[], confirm: boolean }?
+
+local function visual_mode()
+  local mode = api.nvim_get_mode().mode
+  return mode == "v" or mode == "V" or mode == "\22"
+end
 
 local function sidebar_win(tab)
   for _, win in ipairs(api.nvim_tabpage_list_wins(tab or 0)) do
@@ -637,11 +658,32 @@ local function draw_marker()
   api.nvim_buf_clear_namespace(buf, marker_ns, 0, -1)
   local line = api.nvim_win_get_cursor(win)[1]
   if rows[line] then
+    local red = pending and pending.paths[rows[line].path]
     api.nvim_buf_set_extmark(buf, marker_ns, line - 1, 0, {
-      virt_text = { { "▸ ", "YeyitoSidebarMarker" } },
+      virt_text = { { "▸ ", red and "YeyitoSidebarDelete" or "YeyitoSidebarMarker" } },
       virt_text_pos = "overlay",
       hl_mode = "combine",
     })
+  end
+  -- A visual selection's rows, as Exocortex shows them: the whole row in
+  -- the selection's color (there is no CursorLine in visual mode), "│ " on
+  -- the ones the cursor isn't on.
+  if api.nvim_get_current_win() == win and visual_mode() then
+    local from, to = vim.fn.line("v"), line
+    if from > to then
+      from, to = to, from
+    end
+    for i = from, to do
+      if rows[i] then
+        local red = pending and pending.paths[rows[i].path]
+        api.nvim_buf_set_extmark(buf, marker_ns, i - 1, 0, {
+          virt_text = i ~= line and { { "│ ", red and "YeyitoSidebarDelete" or "YeyitoSidebarVisualMarker" } } or nil,
+          virt_text_pos = i ~= line and "overlay" or nil,
+          hl_mode = "combine",
+          line_hl_group = "YeyitoSidebarVisual",
+        })
+      end
+    end
   end
 end
 
@@ -852,7 +894,7 @@ end
 
 local function focused()
   local win = api.nvim_get_current_win()
-  return win == sidebar_win() or (bar ~= nil and win == bar.win)
+  return win == sidebar_win() or (bar ~= nil and win == bar.win) or (menu ~= nil and win == menu.win)
 end
 
 local function close_foot()
@@ -946,7 +988,9 @@ local function close_bar(cancel)
   end
   local side = sidebar_win()
   if side then
-    api.nvim_set_current_win(side)
+    -- Back where it was opened from: Ctrl+P from the editor returns there.
+    local origin = b.origin and api.nvim_win_is_valid(b.origin) and b.origin or side
+    api.nvim_set_current_win(origin)
     render(cancel and b.saved and b.saved.path or nil)
   end
   update_foot()
@@ -1026,6 +1070,13 @@ local function submit_bar()
   end
   local b = bar
   local input = api.nvim_buf_get_lines(b.buf, 0, 1, false)[1] or ""
+  if b.mode == "input" then -- a name for a file operation
+    close_bar(false)
+    vim.schedule(function()
+      b.on_submit(input)
+    end)
+    return
+  end
   if b.mode == "command" then
     close_bar(false)
     -- After the bar's insert mode has ended: leaving it clears the command
@@ -1049,20 +1100,36 @@ local function submit_bar()
   update_foot()
 end
 
---- Open the sidebar's command line in its bottom row: "search" (/ or ?) or "command" (:).
-function M.open_bar(mode, direction)
+--- Open the sidebar's command line in its bottom row: "search" (/ or ?),
+--- "command" (:) or "input": `opts` = { label ("Rename"), text (to start
+--- from), placeholder, on_submit(text), complete(text) -> candidates for Tab,
+--- origin (the window to go back to) }.
+function M.open_bar(mode, direction, opts)
   local side = sidebar_win()
   if not side then
     return
   end
   close_bar(true)
+  opts = opts or {}
   if mode == "search" then
     start_index() -- the project may have changed since the last search
   end
   local b = api.nvim_create_buf(false, true)
   vim.bo[b].bufhidden = "wipe"
-  bar = { mode = mode, direction = direction or search.direction, saved = selected_entry(), buf = b, showmode = vim.o.showmode }
-  local prompt = mode == "command" and ":" or (bar.direction == "forward" and "/" or "?")
+  bar = {
+    mode = mode,
+    direction = direction or search.direction,
+    saved = selected_entry(),
+    buf = b,
+    showmode = vim.o.showmode,
+    on_submit = opts.on_submit,
+    origin = opts.origin,
+  }
+  local prompt = mode == "input" and opts.label .. ":" or mode == "command" and ":"
+    or (bar.direction == "forward" and "/" or "?")
+  if opts.text then
+    api.nvim_buf_set_lines(b, 0, -1, false, { opts.text })
+  end
   bar.win = api.nvim_open_win(b, true, {
     relative = "editor",
     row = vim.o.lines - 1,
@@ -1087,7 +1154,7 @@ function M.open_bar(mode, direction)
     local empty = (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
     if empty and not placeholder then
       placeholder = api.nvim_buf_set_extmark(b, pns, 0, 0, {
-        virt_text = { { mode == "command" and "command" or "search", "YeyitoSidebarPlaceholder" } },
+        virt_text = { { opts.placeholder or (mode == "command" and "command" or "search"), "YeyitoSidebarPlaceholder" } },
         virt_text_pos = "eol",
       })
     elseif not empty and placeholder then
@@ -1125,7 +1192,30 @@ function M.open_bar(mode, direction)
     end
     return "<BS>"
   end, { expr = true })
-  imap("<Tab>", "")
+  -- Tab / Shift+Tab: the candidates for what is typed, in turn.
+  local cycle ---@type { items: string[], i: integer }?
+  local function complete(step)
+    if not opts.complete then
+      return
+    end
+    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
+    if not (cycle and cycle.items[cycle.i] == text) then
+      cycle = { items = opts.complete(text), i = 0 }
+    end
+    if #cycle.items == 0 then
+      return
+    end
+    cycle.i = cycle.i == 0 and (step > 0 and 1 or #cycle.items) or (cycle.i - 1 + step) % #cycle.items + 1
+    local pick = cycle.items[cycle.i]
+    api.nvim_buf_set_lines(b, 0, 1, false, { pick })
+    api.nvim_win_set_cursor(bar.win, { 1, #pick })
+  end
+  imap("<Tab>", function()
+    complete(1)
+  end)
+  imap("<S-Tab>", function()
+    complete(-1)
+  end)
   imap("<C-s>", function()
     close_bar(true)
     M.close()
@@ -1144,7 +1234,7 @@ function M.open_bar(mode, direction)
   -- The bar's insert mode is not the editor's: no "-- INSERT --" beside it.
   vim.o.showmode = false
   update_foot()
-  vim.cmd.startinsert()
+  vim.cmd.startinsert({ bang = opts.text ~= nil }) -- after the text it starts from
 end
 
 --- n / N: the next / previous match of the last search (shows the filter again).
@@ -1166,10 +1256,15 @@ function M.search_next(reverse)
 end
 
 local function set_focused_look(win, focused)
+  -- The selected row's CursorLine has a foreground, over any highlight on the
+  -- row: while it waits for the second d of dd, a red one.
+  local row = rows[api.nvim_win_get_cursor(win)[1]]
+  local red = pending and row and pending.paths[row.path]
   vim.wo[win].winhighlight = table.concat({
     "Normal:YeyitoSidebar",
     "NormalNC:YeyitoSidebar",
-    "CursorLine:YeyitoSidebarSel",
+    "CursorLine:" .. (red and "YeyitoSidebarSelDelete" or "YeyitoSidebarSel"),
+    "Visual:YeyitoSidebarVisual",
     "EndOfBuffer:YeyitoSidebarEnd",
     "StatusLine:YeyitoSidebarStatus",
     "StatusLineNC:YeyitoSidebarStatus",
@@ -1185,6 +1280,583 @@ local function set_focused_look(win, focused)
     vim.o.guicursor = saved_guicursor
     saved_guicursor = nil
   end
+end
+
+-- ── File operations: Exocortex's sidebar keys, for files ──────────────────
+
+local function fail(err)
+  if err then
+    vim.notify(tostring(err), vim.log.levels.ERROR)
+  end
+end
+
+--- A path as the sidebar shows it: in the project, or from home.
+local function rel(path)
+  if path == root then
+    return "."
+  end
+  return vim.startswith(path, root .. "/") and path:sub(#root + 2) or vim.fn.fnamemodify(path, ":~")
+end
+
+local function leave_visual()
+  if visual_mode() then
+    vim.cmd([[execute "normal! \<Esc>"]])
+  end
+end
+
+--- The rows waiting for a second d are red, as in Exocortex.
+local function draw_pending()
+  local win = sidebar_win()
+  if not (buf and win) then
+    return
+  end
+  api.nvim_buf_clear_namespace(buf, delete_ns, 0, -1)
+  if pending then
+    for i, row in ipairs(rows) do
+      if pending.paths[row.path] then
+        api.nvim_buf_set_extmark(buf, delete_ns, i - 1, 0, { end_row = i, hl_group = "YeyitoSidebarDelete", priority = 5000 }) -- over the current file's white
+      end
+    end
+  end
+  set_focused_look(win, focused())
+  draw_marker()
+end
+
+local function clear_pending()
+  if pending then
+    pending = nil
+    vim.on_key(nil, pending_ns)
+    draw_pending()
+  end
+end
+
+local function set_pending(key, items)
+  local paths = {}
+  for _, item in ipairs(items) do
+    paths[item.path] = true
+  end
+  pending = { key = key, paths = paths }
+  -- Any other key lets it go, as in Exocortex.
+  vim.on_key(function(_, typed)
+    if typed ~= "d" and typed ~= "D" then
+      vim.schedule(clear_pending)
+    end
+  end, pending_ns)
+  draw_pending()
+end
+
+--- Without what's inside a folder that is itself in the list.
+local function outermost(items)
+  local dirs = {}
+  for _, item in ipairs(items) do
+    if item.dir then
+      dirs[item.path] = true
+    end
+  end
+  return vim.tbl_filter(function(item)
+    local dir = vim.fs.dirname(item.path)
+    while #dir > #root do
+      if dirs[dir] then
+        return false
+      end
+      dir = vim.fs.dirname(dir)
+    end
+    return true
+  end, items)
+end
+
+--- What an operation acts on: the selected rows in visual mode, else the cursor's.
+local function targets()
+  local win = sidebar_win()
+  if not win then
+    return {}
+  end
+  if visual_mode() and api.nvim_get_current_win() == win then
+    local from, to = vim.fn.line("v"), vim.fn.line(".")
+    if from > to then
+      from, to = to, from
+    end
+    local items = {}
+    for i = from, to do
+      items[#items + 1] = rows[i]
+    end
+    return outermost(items)
+  end
+  local row = cursor_row(win)
+  return row and { row } or {}
+end
+
+--- The tree after an operation, with `select` selected (its folders opened).
+local function after_change(select)
+  children = {} -- read again
+  if active_query() then
+    start_index() -- the filtered list comes from the index: it shows the change when the new one lands
+    render(select)
+  elseif select and vim.startswith(select, root .. "/") then
+    reveal(select)
+  else
+    render()
+  end
+  update_foot()
+end
+
+--- The folder new files and folders go in: the one under the cursor, or the
+--- selected file's.
+local function cursor_folder()
+  local win = sidebar_win()
+  local row = win and cursor_row(win)
+  if not row then
+    return root
+  end
+  return row.dir and row.path or vim.fs.dirname(row.path)
+end
+
+--- `input` as a path: as is when absolute, from home with ~, else in `dir`.
+local function path_in(dir, input)
+  if input:match("^[/~]") then
+    return vim.fs.normalize(vim.fn.fnamemodify(input, ":p"))
+  end
+  return vim.fs.normalize(vim.fs.joinpath(dir, input))
+end
+
+local function delete_items(items)
+  clear_pending()
+  local paths, err = files.delete(items)
+  if paths then
+    after_change()
+  end
+  fail(err)
+end
+
+--- d: the first one marks the rows (red), the second deletes them.
+local function delete_key()
+  local items = targets()
+  if #items == 0 then
+    return
+  end
+  local key = table.concat(vim.tbl_map(function(item)
+    return item.path
+  end, items), "\n")
+  if not (pending and pending.key == key) then
+    set_pending(key, items)
+    return
+  end
+  leave_visual()
+  delete_items(items)
+end
+
+local function undo(redo)
+  clear_pending()
+  local op, err = (redo and files.redo or files.undo)()
+  if not op then
+    return fail(err)
+  end
+  after_change(redo and op.after or op.before)
+  vim.notify((redo and "Redo: " or "Undo: ") .. op.label)
+end
+
+--- Create the file (or folder: a name ending in /) `input` names in `dir`;
+--- a file opens in the editor, which gets the focus.
+local function create(dir, input, as_dir)
+  input = vim.trim(input)
+  if input == "" then
+    return
+  end
+  local is_dir = as_dir or input:sub(-1) == "/"
+  local path = path_in(dir, input)
+  local ok, err = files.create(path, is_dir)
+  if not ok then
+    return fail(err)
+  end
+  if is_dir then
+    expanded[path] = true
+  end
+  if sidebar_win() then
+    after_change(path)
+    if not is_dir then
+      open_file(path)
+      focus_editor()
+    end
+  elseif not is_dir then
+    vim.cmd.edit(vim.fn.fnameescape(path))
+  end
+end
+
+local function folder_placeholder(what, dir)
+  return dir == root and what or "in " .. rel(dir) .. "/"
+end
+
+local function new_file_in(dir, origin)
+  M.open_bar("input", nil, {
+    label = "File",
+    placeholder = folder_placeholder("name", dir),
+    origin = origin,
+    on_submit = function(input)
+      create(dir, input)
+    end,
+  })
+end
+
+--- Ctrl+P: a new file in the folder under the sidebar's cursor (`top`, as
+--- Ctrl+Shift+O: at the top of the project). Without the sidebar, named on
+--- the command line, starting from the current file's folder.
+function M.new_file(top)
+  local side = sidebar_win()
+  if side then
+    clear_pending()
+    leave_visual()
+    local origin = api.nvim_get_current_win()
+    new_file_in(top and root or cursor_folder(), origin ~= side and origin or nil)
+    return
+  end
+  local name = api.nvim_buf_get_name(0)
+  local dir = vim.fn.getcwd()
+  if not top and name ~= "" and vim.bo.buftype == "" then
+    dir = vim.fs.dirname(name)
+  end
+  local start = vim.fn.fnamemodify(dir, ":~:.")
+  vim.ui.input({
+    prompt = "New file: ",
+    default = (start == "" or start == ".") and "" or start .. "/",
+    completion = "file",
+  }, function(input)
+    if input then
+      create(vim.fn.getcwd(), input)
+    end
+  end)
+end
+
+--- f: a new folder where the cursor is; with rows selected, around them
+--- (they move into it, one u undoes both).
+local function new_folder_in(dir, items)
+  M.open_bar("input", nil, {
+    label = "Folder",
+    placeholder = folder_placeholder("name", dir),
+    on_submit = function(input)
+      input = vim.trim(input)
+      if input == "" then
+        return
+      end
+      local path = path_in(dir, input)
+      local ok, err = files.create(path, true)
+      if not ok then
+        return fail(err)
+      end
+      expanded[path] = true
+      local select = path
+      if items and #items > 0 then
+        local moves = vim.tbl_map(function(item)
+          return { from = item.path, to = path .. "/" .. vim.fs.basename(item.path) }
+        end, items)
+        local moved, merr = files.move(moves, "move")
+        if moved then
+          files.combine(2, "new folder " .. vim.fs.basename(path))
+          select = moves[1].to
+        end
+        fail(merr)
+      end
+      after_change(select)
+    end,
+  })
+end
+
+local function new_folder()
+  clear_pending()
+  local items = visual_mode() and targets() or nil
+  leave_visual()
+  new_folder_in(items and items[1] and vim.fs.dirname(items[1].path) or cursor_folder(), items)
+end
+
+local function rename_item(row)
+  if not row then
+    return
+  end
+  clear_pending()
+  local name = vim.fs.basename(row.path)
+  M.open_bar("input", nil, {
+    label = "Rename",
+    text = name,
+    placeholder = "name",
+    on_submit = function(input)
+      input = vim.trim(input)
+      if input == "" or input == name then
+        return
+      end
+      local to = path_in(vim.fs.dirname(row.path), input)
+      local ok, err = files.move({ { from = row.path, to = to } }, "rename")
+      if not ok then
+        return fail(err)
+      end
+      after_change(to)
+    end,
+  })
+end
+
+--- Folders of the project starting with `text`, for Tab in "Move:".
+local function complete_folder(text)
+  local out = {}
+  for _, dir in ipairs(vim.fn.getcompletion(root .. "/" .. text:gsub("^/", ""), "dir")) do
+    if vim.startswith(dir, root .. "/") then
+      out[#out + 1] = dir:sub(#root + 2)
+    end
+  end
+  return out
+end
+
+--- F: move into a folder of the project (empty or / for its top, .. for
+--- one up from where they are, ~ from home).
+local function move_items(items)
+  if #items == 0 then
+    return
+  end
+  clear_pending()
+  M.open_bar("input", nil, {
+    label = "Move",
+    placeholder = "folder",
+    complete = complete_folder,
+    on_submit = function(input)
+      input = vim.trim(input)
+      local from = vim.fs.dirname(items[1].path)
+      local dest
+      if input == "" or input == "/" then
+        dest = root
+      elseif input:match("^%.%.?/") or input == ".." or input:match("^~") then
+        dest = path_in(from, input)
+      else
+        dest = path_in(root, (input:gsub("^/", "")))
+      end
+      local stat = uv.fs_stat(dest)
+      if not (stat and stat.type == "directory") then
+        return fail("No folder " .. rel(dest))
+      end
+      local moves = {}
+      for _, item in ipairs(items) do
+        local to = dest .. "/" .. vim.fs.basename(item.path)
+        if to ~= item.path then
+          moves[#moves + 1] = { from = item.path, to = to }
+        end
+      end
+      if #moves == 0 then
+        return
+      end
+      local ok, err = files.move(moves, "move")
+      if not ok then
+        return fail(err)
+      end
+      after_change(moves[1].to)
+    end,
+  })
+end
+
+--- <: out of the folder they are in, into the one above it.
+local function move_out()
+  local items = targets()
+  leave_visual()
+  clear_pending()
+  local moves = {}
+  for _, item in ipairs(items) do
+    local dir = vim.fs.dirname(item.path)
+    if #dir > #root then
+      moves[#moves + 1] = { from = item.path, to = vim.fs.dirname(dir) .. "/" .. vim.fs.basename(item.path) }
+    end
+  end
+  if #moves == 0 then
+    return
+  end
+  local ok, err = files.move(moves, "move")
+  if not ok then
+    return fail(err)
+  end
+  after_change(moves[1].to)
+end
+
+--- c: a copy beside it ("name copy.ext"), selected.
+local function duplicate(row)
+  if not row then
+    return
+  end
+  clear_pending()
+  files.duplicate(row.path, row.dir, function(to, err)
+    if not to then
+      return fail(err)
+    end
+    after_change(to)
+  end)
+end
+
+local function copy_path(row)
+  if not pcall(vim.fn.setreg, "+", row.path) then
+    vim.fn.setreg('"', row.path)
+  end
+  vim.notify("Copied " .. vim.fn.fnamemodify(row.path, ":~"))
+end
+
+-- ── Actions menu (; or a right click), as Exocortex's ─────────────────────
+
+local menu_ns = api.nvim_create_namespace("yeyito.sidebar.menu")
+
+local function close_menu()
+  local m = menu
+  menu = nil
+  if m and api.nvim_win_is_valid(m.win) then
+    api.nvim_win_close(m.win, true)
+  end
+  local side = sidebar_win()
+  if m and side and api.nvim_get_current_win() ~= side then
+    api.nvim_set_current_win(side)
+  end
+end
+
+local function draw_menu()
+  local m = menu
+  if not m then
+    return
+  end
+  local line = api.nvim_win_get_cursor(m.win)[1]
+  local width = api.nvim_win_get_width(m.win)
+  local lines = {}
+  for i, item in ipairs(m.items) do
+    local text = (i == line and "▸ " or "  ") .. (item.danger and m.confirm and i == line and "You sure?" or item.label)
+    lines[i] = text .. (" "):rep(width - vim.fn.strdisplaywidth(text))
+  end
+  vim.bo[m.buf].modifiable = true
+  api.nvim_buf_set_lines(m.buf, 0, -1, false, lines)
+  vim.bo[m.buf].modifiable = false
+  api.nvim_buf_clear_namespace(m.buf, menu_ns, 0, -1)
+  for i, item in ipairs(m.items) do
+    if item.danger then
+      api.nvim_buf_set_extmark(m.buf, menu_ns, i - 1, 0, { end_row = i, hl_group = "YeyitoSidebarDelete" })
+    end
+  end
+end
+
+local function menu_activate()
+  local m = menu
+  if not m then
+    return
+  end
+  local item = m.items[api.nvim_win_get_cursor(m.win)[1]]
+  if not item then
+    return
+  end
+  if item.danger and not m.confirm then
+    m.confirm = true -- Delete asks "You sure?" first
+    draw_menu()
+    return
+  end
+  close_menu()
+  item.fn()
+end
+
+local function menu_items(row)
+  local items = {}
+  local function add(label, fn, danger)
+    items[#items + 1] = { label = label, fn = fn, danger = danger }
+  end
+  if row.dir then
+    add("New file", function()
+      new_file_in(row.path)
+    end)
+    add("New folder", function()
+      new_folder_in(row.path)
+    end)
+  end
+  add("Rename", function()
+    rename_item(row)
+  end)
+  add("Duplicate", function()
+    duplicate(row)
+  end)
+  add("Move", function()
+    move_items({ row })
+  end)
+  add("Copy path", function()
+    copy_path(row)
+  end)
+  add("Delete", function()
+    delete_items({ row })
+  end, true)
+  return items
+end
+
+--- The actions for the selected row, in a box beside it.
+function M.open_menu()
+  local side = sidebar_win()
+  local row = side and cursor_row(side)
+  if not row then
+    return
+  end
+  clear_pending()
+  leave_visual()
+  close_menu()
+  local items = menu_items(row)
+  local width = vim.fn.strdisplaywidth("You sure?")
+  for _, item in ipairs(items) do
+    width = math.max(width, vim.fn.strdisplaywidth(item.label))
+  end
+  width = width + 3 -- "▸ " and a space
+  -- Its top border on the row, as Exocortex places it, and on the screen.
+  local top = vim.fn.screenpos(side, api.nvim_win_get_cursor(side)[1], 1).row - 1
+  top = math.max(0, math.min(top, vim.o.lines - #items - 2))
+  local mbuf = api.nvim_create_buf(false, true)
+  vim.bo[mbuf].bufhidden = "wipe"
+  local win = api.nvim_open_win(mbuf, true, {
+    relative = "editor",
+    row = top,
+    col = WIDTH,
+    width = width,
+    height = #items,
+    style = "minimal",
+    border = { "┌", "─", "┐", "│", "┘", "─", "└", "│" },
+    zindex = 210,
+  })
+  vim.wo[win].winhighlight = "Normal:YeyitoSidebarMenu,FloatBorder:YeyitoSidebarMenuBorder,CursorLine:YeyitoSidebarMenuSel"
+  vim.wo[win].cursorline = true
+  vim.wo[win].wrap = false
+  vim.wo[win].signcolumn = "no"
+  menu = { win = win, buf = mbuf, items = items, confirm = false }
+  set_focused_look(side, true) -- no terminal cursor in it either
+  draw_menu()
+  local function mmap(lhs, fn)
+    vim.keymap.set("n", lhs, fn, { buffer = mbuf, nowait = true, silent = true })
+  end
+  mmap("<CR>", menu_activate)
+  mmap("<Esc>", close_menu)
+  mmap("q", close_menu)
+  mmap(";", close_menu)
+  mmap("<LeftRelease>", function()
+    local pos = vim.fn.getmousepos()
+    if pos.winid == win and pos.line > 0 then
+      api.nvim_win_set_cursor(win, { pos.line, 0 })
+      menu_activate()
+    end
+  end)
+  local line = 1
+  api.nvim_create_autocmd("CursorMoved", {
+    buffer = mbuf,
+    callback = function()
+      local cur = api.nvim_win_get_cursor(win)
+      if cur[2] ~= 0 then
+        api.nvim_win_set_cursor(win, { cur[1], 0 })
+      end
+      if menu and cur[1] ~= line then
+        line = cur[1]
+        menu.confirm = false
+        draw_menu()
+      end
+    end,
+  })
+  api.nvim_create_autocmd("WinLeave", {
+    buffer = mbuf,
+    once = true,
+    callback = function()
+      vim.schedule(function()
+        if menu and menu.buf == mbuf then
+          close_menu()
+        end
+      end)
+    end,
+  })
 end
 
 local function get_buf()
@@ -1234,12 +1906,57 @@ local function get_buf()
   map("N", function()
     M.search_next(true)
   end, "Previous match")
+  -- Exocortex's sidebar keys, for files.
+  map("d", delete_key, "Delete (to the trash): press twice")
+  map("D", delete_key, "Delete (to the trash): press twice")
+  map("u", function()
+    undo(false)
+  end, "Undo the last file operation")
+  map("<C-r>", function()
+    undo(true)
+  end, "Redo the last undone file operation")
+  map("r", function()
+    rename_item(cursor_row(api.nvim_get_current_win()))
+  end, "Rename")
+  map("c", function()
+    duplicate(cursor_row(api.nvim_get_current_win()))
+  end, "Duplicate")
+  map("f", new_folder, "New folder")
+  map("F", function()
+    move_items(targets())
+  end, "Move to a folder")
+  map("<", move_out, "Move out of its folder")
+  map(";", M.open_menu, "Actions menu")
+  map("J", "j", "Next row")
+  map("K", "k", "Previous row")
+  map("<Esc>", clear_pending, "Cancel")
+  local function xmap(lhs, fn, desc)
+    vim.keymap.set("x", lhs, fn, { buffer = buf, nowait = true, silent = true, desc = desc })
+  end
+  xmap("d", delete_key, "Delete the selected rows (to the trash): press twice")
+  xmap("D", delete_key, "Delete the selected rows (to the trash): press twice")
+  xmap("f", new_folder, "New folder for the selected rows")
+  xmap("F", function()
+    local items = targets()
+    leave_visual()
+    move_items(items)
+  end, "Move the selected rows to a folder")
+  xmap("<", move_out, "Move the selected rows out of their folder")
   api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
       local win = api.nvim_get_current_win()
       if api.nvim_win_get_cursor(win)[2] ~= 0 then
         api.nvim_win_set_cursor(win, { api.nvim_win_get_cursor(win)[1], 0 })
+      end
+      draw_marker()
+    end,
+  })
+  api.nvim_create_autocmd("ModeChanged", {
+    buffer = buf,
+    callback = function()
+      if not visual_mode() then
+        clear_pending() -- the rows it marked were the selection
       end
       draw_marker()
     end,
@@ -1339,6 +2056,14 @@ local function highlights()
   set(0, "YeyitoSidebarBar", { fg = "#ffffff", bg = "#030814" })
   set(0, "YeyitoSidebarPrompt", { fg = "#1d9bf0", bg = "#030814" })
   set(0, "YeyitoSidebarPlaceholder", { fg = "#646464", bg = "#030814" })
+  -- dd's first d, Delete in the menu: st's red, as Exocortex's error color.
+  set(0, "YeyitoSidebarDelete", { fg = colors.palette.red })
+  set(0, "YeyitoSidebarSelDelete", { fg = colors.palette.red, bg = "#0f193c" })
+  set(0, "YeyitoSidebarVisual", { bg = "#0f193c" })
+  set(0, "YeyitoSidebarVisualMarker", { fg = "#646464" })
+  set(0, "YeyitoSidebarMenu", { fg = "#ffffff", bg = "#030814" })
+  set(0, "YeyitoSidebarMenuSel", { bg = "#0f193c" })
+  set(0, "YeyitoSidebarMenuBorder", { fg = "#1d9bf0", bg = "#030814" })
   api.nvim_set_hl(0, "YeyitoSidebarCursor", { blend = 100, bg = "#030814", fg = "#030814" })
 end
 
@@ -1349,6 +2074,25 @@ function M.setup()
   vim.keymap.set("x", "<C-s>", "<Esc><Cmd>lua require('yeyito.sidebar').toggle()<CR>", { desc = "File sidebar: open focused / close" })
   vim.keymap.set("i", "<C-s>", "<Esc><Cmd>lua require('yeyito.sidebar').toggle()<CR>", { desc = "File sidebar: open focused / close" })
   vim.keymap.set("n", "<Tab>", M.tab, { desc = "Switch between the file sidebar and the editor" })
+  vim.keymap.set("n", "<C-p>", function()
+    M.new_file(false)
+  end, { desc = "New file (in the folder under the sidebar's cursor)" })
+  vim.keymap.set("n", "<C-S-o>", function()
+    M.new_file(true)
+  end, { desc = "New file at the top of the project" })
+  -- A right click on a sidebar row opens its actions menu; elsewhere, as usual.
+  vim.keymap.set("n", "<RightMouse>", function()
+    local pos = vim.fn.getmousepos()
+    if pos.winid ~= 0 and pos.winid == sidebar_win() and pos.line > 0 and rows[pos.line] then
+      vim.schedule(function()
+        api.nvim_set_current_win(pos.winid)
+        api.nvim_win_set_cursor(pos.winid, { pos.line, 0 })
+        M.open_menu()
+      end)
+      return ""
+    end
+    return "<RightMouse>"
+  end, { expr = true, desc = "Sidebar: actions menu" })
 
   local group = api.nvim_create_augroup("yeyito.sidebar", { clear = true })
   api.nvim_create_autocmd("ColorScheme", { group = group, callback = highlights })
@@ -1358,7 +2102,7 @@ function M.setup()
       local win = api.nvim_get_current_win()
       local side = sidebar_win()
       if side then
-        set_focused_look(side, win == side)
+        set_focused_look(side, focused())
         update_foot()
       end
       if is_editor_win(win) then

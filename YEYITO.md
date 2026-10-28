@@ -72,7 +72,7 @@ and wait for them, up to seconds on the Mac (`options.lua`).
 | `indent_guides.lua` | Indent guides (was indent-blankline.nvim). |
 | `marks.lua` | Marks in the sign column + marks.nvim's mappings and bookmarks. |
 | `smoothscroll.lua` | Marks which redraws are view scrolls, for the TUI to glide. |
-| `sidebar.lua` | The Ctrl+S file sidebar. |
+| `sidebar.lua`, `files.lua` | The Ctrl+S file sidebar; its file operations (trash, rename/move, undo). |
 | `markdown_links.lua`, `markdown_refresh.lua`, `strikethrough.lua`, `persist_local_marks.lua` | My Markdown and marks tools. |
 | `queries/` | Highlight/indent/textobject queries for the bundled languages. |
 | `overrides/queries/` | Replacements for built-in queries (Markdown); see its README. |
@@ -174,6 +174,35 @@ Like Exocortex's sidebar it has its own command line, in its bottom row
 - **`:`** is the sidebar's command line: `:noh` clears the filter and shows
   the selection in the tree; anything else runs as an Ex command in the editor
   (`:w`, `:e file`, `:q`), focus staying in the sidebar.
+
+Exocortex's sidebar keys work on files too:
+
+- **`dd`** deletes the file or folder under the cursor: the first `d` turns
+  the row red, the second deletes (any other key lets it go). It goes to the
+  system's trash (Finder's on macOS, `~/.local/share/Trash` elsewhere), so
+  it can come back.
+- **`u`** / **`Ctrl+R`** undo / redo the last file operation (deleting,
+  renaming, moving, creating, duplicating), for as long as Neovim runs.
+- **`Ctrl+P`** (from the sidebar or the editor): a new file in the folder
+  under the sidebar's cursor (or the selected file's folder); it opens in the
+  editor. A name ending in `/` makes a folder. **`Ctrl+Shift+O`**: at the top
+  of the project. Without the sidebar, `Ctrl+P` asks on the command line,
+  from the current file's folder. Insert mode's `Ctrl+P` still completes.
+- **`f`** new folder, **`r`** rename (from the current name), **`c`**
+  duplicate (`name copy.ext`), **`F`** move into a folder of the project (Tab
+  completes; empty or `/` is the top, `..` one up), **`<`** move out of its
+  folder.
+- **`v`** / **`V`** select rows: `dd`, `F`, `<` and `f` (a new folder, with
+  the selection moved into it) act on all of them.
+- **`;`** or a right click: the actions menu beside the row (Rename,
+  Duplicate, Move, Copy path, Delete, which asks "You sure?"; on a folder
+  also New file and New folder). `j`/`k`, Enter or a click, Esc.
+
+A file with unsaved changes isn't deleted, renamed or moved (save it first);
+open buffers follow a rename or move, with their undo history, and language
+servers are told. Not carried over: Exocortex's reordering (`e`/`E`), pins,
+stars and unwrap (`x`), which have no meaning for a sorted file tree, and
+`Ctrl+J`/`Ctrl+K` (they move lines here; Tab switches focus).
 
 Scrolling the sidebar jumps rather than glides. It is a feature flag,
 `g:yeyito_sidebar_smooth_scroll` (off; read on every scroll, so `:let
