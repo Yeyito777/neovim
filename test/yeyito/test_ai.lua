@@ -216,8 +216,104 @@ else
   os.remove(sock)
 end
 
-files.trash_root = nil
-vim.fn.delete(dir, "rf")
-vim.fn.delete(trash, "rf")
-io.stdout:write(failures .. " failure(s)\n")
-vim.cmd(failures == 0 and "qa!" or "cq!")
+-- The request box: all of Vim. Typing needs the main loop, so these run as
+-- timed steps (feedkeys "x!" would block in insert mode).
+local steps = {}
+local function step(fn)
+  steps[#steps + 1] = fn
+end
+local function send(k)
+  api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "m", false)
+end
+local function box()
+  for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+    if api.nvim_win_get_config(win).zindex == 220 then
+      return win
+    end
+  end
+end
+local function badge()
+  local frame = box()
+  if not frame then
+    return nil
+  end
+  local ns = api.nvim_create_namespace("yeyito.sidebar.modal")
+  for _, m in ipairs(api.nvim_buf_get_extmarks(api.nvim_win_get_buf(frame), ns, 0, 0, { details = true })) do
+    if m[4].virt_text then
+      return vim.trim(m[4].virt_text[1][1])
+    end
+  end
+end
+local function field()
+  return table.concat(api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+end
+local asked
+step(function()
+  vim.cmd.edit(dir .. "/src/app.py")
+  ai.open(nil)
+  send("fix this")
+end)
+step(function()
+  check("the box opens in insert mode, saying so", api.nvim_get_mode().mode == "i" and badge() == "INSERT", badge())
+  send("<Esc>")
+end)
+step(function()
+  check("Esc: normal mode, still in the box", box() ~= nil and api.nvim_get_mode().mode == "n" and badge() == "NORMAL", badge())
+  send("0cwrename<Esc>")
+end)
+step(function()
+  check("vim edits (cw)", field() == "rename this", field())
+  send("v")
+end)
+step(function()
+  check("visual mode shows", badge() == "VISUAL", badge())
+  send("<Esc>osecond line<Esc>")
+end)
+step(function()
+  local frame = box()
+  check("o adds a line, and the box grows", field() == "rename this\nsecond line" and api.nvim_win_get_height(0) == 2
+    and frame and api.nvim_win_get_height(frame) == 4, field())
+  send("<Esc>")
+end)
+step(function()
+  check("Esc in normal mode closes it", box() == nil)
+  ai.open(nil)
+end)
+step(function()
+  check("the next box starts from what was typed", field() == "rename this\nsecond line", field())
+  ai.ask = function(text)
+    asked = text
+  end
+  send("<Esc><CR>")
+end)
+step(function()
+  check("Enter in normal mode sends it (all of it)", asked == "rename this\nsecond line" and box() == nil, asked)
+  ai.open(nil)
+end)
+step(function()
+  check("then the box starts empty", field() == "", field())
+  send("one<S-CR>two<CR>")
+end)
+step(function()
+  check("Shift+Enter adds a line; Enter in insert mode sends", asked == "one\ntwo", asked)
+end)
+
+local function next_step(i)
+  if i > #steps then
+    files.trash_root = nil
+    vim.fn.delete(dir, "rf")
+    vim.fn.delete(trash, "rf")
+    io.stdout:write(failures .. " failure(s)\n")
+    vim.cmd(failures == 0 and "qa!" or "cq!")
+    return
+  end
+  local ok, e = pcall(steps[i])
+  if not ok then
+    io.stdout:write("ERROR step " .. i .. ": " .. tostring(e) .. "\n")
+    failures = failures + 1
+  end
+  vim.defer_fn(function()
+    next_step(i + 1)
+  end, 150)
+end
+next_step(1)

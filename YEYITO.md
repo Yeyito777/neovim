@@ -242,9 +242,14 @@ The model (Sonnet 5.5; `g:yeyito_ai_model` picks another) works on the
 project through Neovim, on your Exocortex daemon: it needs `exocortexd`
 running (it says so when it isn't). No API keys here: the daemon's logins.
 
-- **`<leader>a`**: a box in the middle of the editor (as the sidebar's
-  names); type the request, Enter. In visual mode, about the selected lines
-  (the title says how many). **`:Ai request`** does the same from the
+- **`<leader>a`**: a box in the middle of the editor; type the request,
+  Enter. In visual mode, about the selected lines (the title says how many).
+  The box is a little editor with all of Vim, as Exocortex's centred editor:
+  it starts in insert mode, Esc goes to normal mode (the mode shows top
+  right), visual mode, motions, operators and undo work; Shift+Enter or
+  Ctrl+L adds a line and the box grows. Enter (insert or normal mode) sends
+  it; Esc in normal mode closes it, and what you typed is there the next time
+  it opens. **`:Ai request`** does the same from the
   command line (`:ai` too; `:'<,'>Ai ...` about those lines).
 - While it works the selected lines are tinted and a card in the top right
   says what it's doing (`⠋ Sonnet 5.5 · editing src/main.c`). Keep editing

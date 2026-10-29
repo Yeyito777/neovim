@@ -142,6 +142,21 @@ def main():
     finally:
         t.close()
 
+    # The AI's request box takes st's keys: Shift+Enter (CSI 13;2u) is a new
+    # line, Esc goes to normal mode.
+    t, layout, expr = run()
+    try:
+        t.keys(b" a")  # <leader>a
+        t.keys(b"one\x1b[13;2utwo")
+        lines = expr("json_encode(getline(1, '$'))")
+        t.keys(b"\x1b")
+        mode = expr("json_encode(mode())")
+        check("AI box: Shift+Enter from st adds a line; Esc is normal mode",
+              lines == ["one", "two"] and mode == "n", (lines, mode))
+        t.keys(b"\x1b")
+    finally:
+        t.close()
+
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 

@@ -34,6 +34,7 @@ local convs = {} ---@type table<string, table> project -> conversation
 local busy = {} ---@type table<string, table> project -> the running turn
 local log = {} ---@type table<string, table[]> project -> { request, did, reply }
 local applying = false -- our own buffer changes: they keep the green tint
+local draft ---@type string? a request closed without sending, for the next box
 
 -- ── Paths ─────────────────────────────────────────────────────────────────
 
@@ -765,8 +766,15 @@ function M.open(sel)
   require("yeyito.sidebar").prompt({
     title = title,
     placeholder = "what to do",
+    vim = true,
+    text = draft,
     on_submit = function(text)
+      draft = nil
       M.ask(text, sel)
+    end,
+    on_cancel = function(text)
+      -- Kept for the next time the box opens.
+      draft = vim.trim(text) ~= "" and text or nil
     end,
   })
 end

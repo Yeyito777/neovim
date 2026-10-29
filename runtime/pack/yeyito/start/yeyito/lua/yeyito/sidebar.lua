@@ -1431,28 +1431,38 @@ local function close_modal()
   end
 end
 
---- Ask for a name in a box in the middle of the editor, Exocortex's
---- overlay: its title, a line for what went wrong, and the text to type.
---- Enter submits, Esc cancels. `opts` = { title, text (to start from),
---- placeholder, error, complete(text) -> candidates for Tab,
---- on_submit(text) -> nil when done, or why not: it asks again with that }.
+local MODES = {
+  n = { "NORMAL", "YeyitoModeNormal" },
+  i = { "INSERT", "YeyitoModeInsert" },
+  v = { "VISUAL", "YeyitoModeVisual" },
+  V = { "V-LINE", "YeyitoModeVisual" },
+  ["\22"] = { "V-BLOCK", "YeyitoModeVisual" },
+  R = { "REPLACE", "YeyitoModeInsert" },
+  c = { "COMMAND", "YeyitoModeNormal" },
+}
+
+--- Ask for text in a box in the middle of the editor, Exocortex's overlay:
+--- its title, a line for what went wrong, and the text field. `opts` =
+--- { title, text (to start from), placeholder, error, complete(text) ->
+--- candidates for Tab, on_submit(text) -> nil when done, or why not: it asks
+--- again with that, on_cancel(text), vim }.
+--- A name (default): one line, Enter submits, Esc cancels. With `vim`, the
+--- field is a little editor with all of Vim (Exocortex's centred editor):
+--- it grows with the text, Esc goes to normal mode (the mode shows in the
+--- title), Enter in insert or normal mode submits, Shift+Enter or Ctrl+L
+--- add a line, Esc in normal mode cancels.
 local function prompt(opts)
   close_modal()
   local origin = api.nvim_get_current_win()
   -- Centred in the editor's part of the screen, right of the sidebar.
   local left = sidebar_win() and WIDTH or 0
   local area = vim.o.columns - left
-  local width = math.max(20, math.min(56, area - 4))
-  local row = math.max(0, math.floor((vim.o.lines - 5) / 2))
+  local width = math.max(20, math.min(opts.vim and 72 or 56, area - 4))
+  local max_height = math.max(1, math.min(12, vim.o.lines - 10))
+  local row = math.max(0, math.floor((vim.o.lines - 5) / 2) - (opts.vim and 2 or 0))
   local col = left + math.max(0, math.floor((area - width - 2) / 2))
   local fbuf = api.nvim_create_buf(false, true)
   vim.bo[fbuf].bufhidden = "wipe"
-  local title = " " .. opts.title
-  api.nvim_buf_set_lines(fbuf, 0, -1, false, { title, opts.error and " " .. opts.error or "", "" })
-  if opts.error then
-    api.nvim_buf_set_extmark(fbuf, modal_ns, 1, 0, { end_row = 2, hl_group = "YeyitoSidebarDelete" })
-  end
-  api.nvim_buf_set_extmark(fbuf, modal_ns, 2, 0, { line_hl_group = "YeyitoSidebarField" })
   local border = { "┌", "─", "┐", "│", "┘", "─", "└", "│" }
   local frame = api.nvim_open_win(fbuf, false, {
     relative = "editor",
@@ -1467,11 +1477,11 @@ local function prompt(opts)
     noautocmd = true,
   })
   vim.wo[frame].winhighlight = "Normal:YeyitoSidebarMenu,FloatBorder:YeyitoSidebarMenuBorder"
-  -- The text field: its own window on the box's last line.
+  -- The text field: its own window on the box's last lines.
   local b = api.nvim_create_buf(false, true)
   vim.bo[b].bufhidden = "wipe"
   if opts.text then
-    api.nvim_buf_set_lines(b, 0, -1, false, { opts.text })
+    api.nvim_buf_set_lines(b, 0, -1, false, vim.split(opts.text, "\n", { plain = true }))
   end
   local input = api.nvim_open_win(b, true, {
     relative = "editor",
@@ -1484,13 +1494,61 @@ local function prompt(opts)
     noautocmd = true,
   })
   vim.wo[input].winhighlight = "Normal:YeyitoSidebarField"
-  vim.wo[input].wrap = false
+  vim.wo[input].wrap = opts.vim == true
+  vim.wo[input].linebreak = true
   vim.wo[input].signcolumn = "no"
   modal = { frame = frame, input = input, origin = origin, showmode = vim.o.showmode }
-  vim.o.showmode = false -- no "-- INSERT --": it's a text field
+  vim.o.showmode = false -- no "-- INSERT --" down below: the box says it
+
+  local function text()
+    local lines = api.nvim_buf_get_lines(b, 0, -1, false)
+    return opts.vim and table.concat(lines, "\n") or lines[1] or ""
+  end
+
+  -- The frame: title (and the mode), what went wrong, and the field's rows.
+  local height = 1
+  local function draw_frame()
+    local lines = { " " .. opts.title, opts.error and " " .. opts.error or "" }
+    for _ = 1, height do
+      lines[#lines + 1] = ""
+    end
+    api.nvim_buf_set_lines(fbuf, 0, -1, false, lines)
+    api.nvim_buf_clear_namespace(fbuf, modal_ns, 0, -1)
+    if opts.error then
+      api.nvim_buf_set_extmark(fbuf, modal_ns, 1, 0, { end_row = 2, hl_group = "YeyitoSidebarDelete" })
+    end
+    for i = 2, 1 + height do
+      api.nvim_buf_set_extmark(fbuf, modal_ns, i, 0, { line_hl_group = "YeyitoSidebarField" })
+    end
+    if opts.vim then
+      local mode = MODES[api.nvim_get_mode().mode:sub(1, 1)] or MODES.n
+      api.nvim_buf_set_extmark(fbuf, modal_ns, 0, 0, {
+        virt_text = { { mode[1] .. " ", mode[2] } },
+        virt_text_pos = "right_align",
+      })
+    end
+  end
+  --- The field grows with the text (wrapped), up to max_height rows.
+  local function relayout()
+    if not (modal and modal.input == input and api.nvim_win_is_valid(input)) then
+      return
+    end
+    local want = 1
+    if opts.vim then
+      want = math.max(1, math.min(max_height, api.nvim_win_text_height(input, {}).all))
+    end
+    if want ~= height then
+      height = want
+      api.nvim_win_set_config(input, { height = height })
+      api.nvim_win_set_config(frame, { height = 2 + height })
+    end
+    draw_frame()
+  end
+  draw_frame()
+
   local placeholder ---@type integer?
   local function show_placeholder()
-    local empty = (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
+    local empty = api.nvim_buf_line_count(b) == 1 and (api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
     if empty and not placeholder and opts.placeholder then
       placeholder = api.nvim_buf_set_extmark(b, modal_ns, 0, 0, {
         virt_text = { { opts.placeholder, "YeyitoSidebarFieldPlaceholder" } },
@@ -1507,35 +1565,60 @@ local function prompt(opts)
       vim.schedule(function()
         if api.nvim_buf_is_valid(b) then
           show_placeholder()
+          relayout()
         end
       end)
     end,
   })
-  local function imap(lhs, fn)
-    vim.keymap.set("i", lhs, fn, { buffer = b, nowait = true })
-  end
-  imap("<CR>", function()
-    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
+  relayout() -- for the text it starts from
+
+  local function submit()
+    local t = text()
     close_modal()
     -- Once out of the text field's insert mode.
     vim.schedule(function()
-      local err = opts.on_submit(text)
+      local err = opts.on_submit(t)
       if err then
-        prompt(vim.tbl_extend("force", opts, { text = text, error = err }))
+        prompt(vim.tbl_extend("force", opts, { text = t, error = err }))
       end
     end)
-  end)
-  imap("<Esc>", close_modal)
-  imap("<C-c>", close_modal)
+  end
+  local function cancel()
+    local t = text()
+    close_modal()
+    if opts.on_cancel then
+      opts.on_cancel(t)
+    end
+  end
+  local function map(mode, lhs, fn)
+    vim.keymap.set(mode, lhs, fn, { buffer = b, nowait = true })
+  end
+  if opts.vim then
+    map({ "i", "n" }, "<CR>", submit)
+    map("i", "<S-CR>", "<CR>") -- not remapped: a new line
+    map("n", "<Esc>", cancel)
+    api.nvim_create_autocmd("ModeChanged", {
+      buffer = b,
+      callback = function()
+        if modal and modal.input == input then
+          draw_frame()
+        end
+      end,
+    })
+  else
+    map("i", "<CR>", submit)
+    map("i", "<Esc>", cancel)
+    map("i", "<C-c>", cancel)
+  end
   -- Tab / Shift+Tab: the candidates for what is typed, in turn.
   local cycle ---@type { items: string[], i: integer }?
   local function complete(step)
     if not opts.complete then
       return
     end
-    local text = api.nvim_buf_get_lines(b, 0, 1, false)[1] or ""
-    if not (cycle and cycle.items[cycle.i] == text) then
-      cycle = { items = opts.complete(text), i = 0 }
+    local t = text()
+    if not (cycle and cycle.items[cycle.i] == t) then
+      cycle = { items = opts.complete(t), i = 0 }
     end
     if #cycle.items == 0 then
       return
@@ -1545,25 +1628,30 @@ local function prompt(opts)
     api.nvim_buf_set_lines(b, 0, 1, false, { pick })
     api.nvim_win_set_cursor(input, { 1, #pick })
   end
-  imap("<Tab>", function()
-    complete(1)
-  end)
-  imap("<S-Tab>", function()
-    complete(-1)
-  end)
-  -- A click elsewhere cancels it.
+  if opts.complete then
+    map("i", "<Tab>", function()
+      complete(1)
+    end)
+    map("i", "<S-Tab>", function()
+      complete(-1)
+    end)
+  end
+  -- A click elsewhere cancels it (the text goes to on_cancel).
   api.nvim_create_autocmd("WinLeave", {
     buffer = b,
     once = true,
     callback = function()
       vim.schedule(function()
         if modal and modal.input == input then
-          close_modal()
+          cancel()
         end
       end)
     end,
   })
-  vim.cmd.startinsert({ bang = true }) -- after the text it starts from
+  -- Typing goes after the text it starts from.
+  local last = api.nvim_buf_line_count(b)
+  api.nvim_win_set_cursor(input, { last, #(api.nvim_buf_get_lines(b, last - 1, last, false)[1] or "") })
+  vim.cmd.startinsert({ bang = true })
 end
 
 --- The name prompt, for other modules (the AI's request box).
@@ -2189,6 +2277,10 @@ local function highlights()
   -- The name prompt's text field: the selected row's colour, as Exocortex's overlays mark theirs.
   set(0, "YeyitoSidebarField", { fg = "#ffffff", bg = "#0f193c" })
   set(0, "YeyitoSidebarFieldPlaceholder", { fg = "#646464", bg = "#0f193c" })
+  -- The box's vim mode, in Exocortex's mode colours.
+  set(0, "YeyitoModeNormal", { fg = "#48cae4", bg = "#030814", bold = true })
+  set(0, "YeyitoModeInsert", { fg = "#2ec4b6", bg = "#030814", bold = true })
+  set(0, "YeyitoModeVisual", { fg = "#c792ea", bg = "#030814", bold = true })
   api.nvim_set_hl(0, "YeyitoSidebarCursor", { blend = 100, bg = "#030814", fg = "#030814" })
 end
 
