@@ -492,6 +492,35 @@ function M.create(path, is_dir)
   return true
 end
 
+--- Something else made `path` (the AI): u moves it to the trash, Ctrl+R puts
+--- it back.
+function M.created(path, is_dir, text)
+  local trashed
+  record({
+    label = text or ((is_dir and "new folder " or "new file ") .. name_of(path)),
+    after = path,
+    undo = function()
+      local why = M.unsaved(path)
+      if why then
+        return nil, why
+      end
+      close_buffers(path)
+      local t, err = trash(path, is_dir)
+      if not t then
+        return nil, err
+      end
+      trashed = t
+      return true
+    end,
+    redo = function()
+      if not trashed then
+        return nil, name_of(path) .. " is gone"
+      end
+      return restore(trashed)
+    end,
+  })
+end
+
 --- Where a copy of `path` goes: "name copy.ext", "name copy 2.ext"...
 function M.copy_path(path, is_dir)
   return free_path(vim.fs.dirname(path), name_of(path), is_dir, " copy")

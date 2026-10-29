@@ -73,6 +73,7 @@ and wait for them, up to seconds on the Mac (`options.lua`).
 | `marks.lua` | Marks in the sign column + marks.nvim's mappings and bookmarks. |
 | `smoothscroll.lua` | Marks which redraws are view scrolls, for the TUI to glide. |
 | `sidebar.lua`, `files.lua` | The Ctrl+S file sidebar; its file operations (trash, rename/move, undo). |
+| `ai.lua`, `lua/exocortex/` | `<leader>a` / `:Ai`: the AI on the Exocortex daemon; the app API client (vendored). |
 | `markdown_links.lua`, `markdown_refresh.lua`, `strikethrough.lua`, `persist_local_marks.lua` | My Markdown and marks tools. |
 | `queries/` | Highlight/indent/textobject queries for the bundled languages. |
 | `overrides/queries/` | Replacements for built-in queries (Markdown); see its README. |
@@ -232,6 +233,40 @@ Tests: `VIMRUNTIME=$PWD/runtime build/bin/nvim --headless -u NORC -c 'luafile
 test/yeyito/test_sidebar.lua'` (behavior and search; `$PWD` because it `cd`s) and `python3
 test/yeyito/test_sidebar_layout.py` (the real TUI on a fake st: full height,
 command line and pager beside it).
+
+## AI (`<leader>a`, `:Ai`)
+
+The model (Sonnet 5.5; `g:yeyito_ai_model` picks another) works on the
+project through Neovim, on your Exocortex daemon: it needs `exocortexd`
+running (it says so when it isn't). No API keys here: the daemon's logins.
+
+- **`<leader>a`**: a box in the middle of the editor (as the sidebar's
+  names); type the request, Enter. In visual mode, about the selected lines
+  (the title says how many). **`:Ai request`** does the same from the
+  command line (`:ai` too; `:'<,'>Ai ...` about those lines).
+- While it works the selected lines are tinted and a card in the top right
+  says what it's doing (`⠋ Sonnet 5.5 · editing src/main.c`). Keep editing
+  meanwhile; **Ctrl+Q** stops it (otherwise Ctrl+Q is what it was).
+- Its changes land at once: edited lines are tinted green until you edit
+  them, files are saved (a file with your own unsaved changes is edited but
+  left for you to save), files it makes show in the sidebar.
+- **Undo**: one `u` in a buffer undoes a request's edits there; `u` in the
+  sidebar undoes the files it created, moved or deleted (to the trash).
+- Its reply shows in the card (`code` as in Exocortex); Esc puts it away.
+  **`:Ai log`** shows this session's requests, what it did and the replies.
+- One conversation per project (the working directory), hidden from the
+  Exocortex sidebar, kept until it has been idle an hour (a Neovim started
+  meanwhile picks it up). **`:Ai new`** starts a fresh one.
+
+Its tools: `read_file` (what the editor has, unsaved changes too),
+`edit_file`, `write_file`, `move_path`, `delete_path`, all run by Neovim,
+plus the daemon's shell, `glob` and `grep`; it is told to change files only
+through the editor's. It is `ai.lua`, using Exocortex's app API with its
+Lua client, vendored as `lua/exocortex/` (Exocortex's `docs/app-api.md`).
+
+Tests: `VIMRUNTIME=$PWD/runtime build/bin/nvim --headless -u NORC -c
+'luafile test/yeyito/test_ai.lua'` (the tools, then the whole path against
+Exocortex's fake daemon: needs bun and an Exocortex checkout).
 
 ## Command line and messages
 

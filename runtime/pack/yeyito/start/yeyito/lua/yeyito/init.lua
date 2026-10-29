@@ -28,6 +28,8 @@ function M.setup()
   require("yeyito.autocmds").setup()
   -- Markdown links: colored labels, click/Enter to open, Space m e / Space m a to edit.
   require("yeyito.markdown_links").setup()
+  -- <leader>a / :Ai: the AI edits the project through Neovim (Exocortex daemon).
+  require("yeyito.ai").setup()
 end
 
 return M

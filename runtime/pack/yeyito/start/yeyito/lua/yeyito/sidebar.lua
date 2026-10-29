@@ -1565,6 +1565,16 @@ local function prompt(opts)
   vim.cmd.startinsert({ bang = true }) -- after the text it starts from
 end
 
+--- The name prompt, for other modules (the AI's request box).
+M.prompt = prompt
+
+--- Files changed outside the sidebar (the AI): show `path` (selected), if it is open.
+function M.changed(path)
+  if sidebar_win() then
+    after_change(path)
+  end
+end
+
 local function in_folder(dir)
   return dir == root and "" or " in " .. rel(dir) .. "/"
 end

@@ -9,6 +9,8 @@ local flags = {
   -- lets the command line sit beside the sidebar instead of under it. Off:
   -- the classic command line and hit-enter prompts. Read at startup.
   yeyito_ui2 = true,
+  -- The model <leader>a and :Ai ask (on the Exocortex daemon; see ai.lua).
+  yeyito_ai_model = "claude-sonnet-5-5",
 }
 
 function M.setup()
