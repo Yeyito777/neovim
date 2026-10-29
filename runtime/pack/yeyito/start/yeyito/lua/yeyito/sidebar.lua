@@ -3,7 +3,8 @@
 -- running the full height of the screen (the command line and messages stay
 -- beside it, with ui2: see yeyito/init.lua).
 --   Ctrl+S   open it focused on the current file, or close it back to the editor
---   Tab      switch focus between it and the editor while it is open
+--   Tab      switch focus between it and the editor while it is open (Ctrl+J
+--            and Ctrl+K too, as in Exocortex; keymaps.lua)
 -- In the sidebar: j/k move; Enter, l or a click opens a file in the editor
 -- (focus stays here, as in Exocortex) or opens/closes a folder; h/Backspace
 -- closes the folder; i/a go back to the editor; q closes; R reloads. The
@@ -2142,6 +2143,11 @@ function M.toggle()
   else
     M.open()
   end
+end
+
+--- The sidebar is open in this tab page.
+function M.is_open()
+  return sidebar_win() ~= nil
 end
 
 --- Tab: switch between the sidebar and the editor; without the sidebar, Tab

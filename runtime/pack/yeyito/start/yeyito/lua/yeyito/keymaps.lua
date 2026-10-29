@@ -65,9 +65,22 @@ function M.setup()
   map("n", "]w", function() jump(1) end, { desc = "Next diagnostic" })
   map("n", "[w", function() jump(-1) end, { desc = "Previous diagnostic" })
 
-  -- Move lines
-  map("n", "<C-j>", ":m .+1<CR>==", { silent = true })
-  map("n", "<C-k>", ":m .-2<CR>==", { silent = true })
+  -- Ctrl+J / Ctrl+K: with the file sidebar open, switch focus between it and
+  -- the editor (as in Exocortex); otherwise move the line down / up.
+  local function focus_or_move(down)
+    return function()
+      local sidebar = require("yeyito.sidebar")
+      if sidebar.is_open() then
+        sidebar.tab()
+      else
+        vim.cmd(down and "silent! move .+1" or "silent! move .-2")
+        vim.cmd("normal! ==")
+      end
+    end
+  end
+  map("n", "<C-j>", focus_or_move(true), { silent = true, desc = "Sidebar open: switch focus; else move the line down" })
+  map("n", "<C-k>", focus_or_move(false), { silent = true, desc = "Sidebar open: switch focus; else move the line up" })
+  -- Move the selected lines (in visual mode always).
   map("x", "<C-j>", ":m '>+1<CR>gv=gv", { silent = true })
   map("x", "<C-k>", ":m '<-2<CR>gv=gv", { silent = true })
 

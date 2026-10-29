@@ -147,8 +147,11 @@ and prompts stay to its right (see [Command line and messages](#command-line-and
 
 - **Ctrl+S** (normal, visual and insert mode): open it focused, on the current
   file (its folders opened), or close it back to the editor.
-- **Tab**: switch focus between it and the editor while it is open (otherwise
-  Tab is CTRL-I as usual). The border is blue while the sidebar has focus.
+- **Tab**, **Ctrl+J** or **Ctrl+K** (normal mode): switch focus between it
+  and the editor while it is open, as in Exocortex. Without the sidebar they
+  keep their meaning: Tab is CTRL-I, Ctrl+J/Ctrl+K move the line down/up (in
+  visual mode they always move the selected lines). The border is blue while
+  the sidebar has focus.
 - In the sidebar: `j`/`k` move; **Enter**, `l` or a click opens a file in the
   editor (focus stays in the sidebar, as in Exocortex) or opens/closes a
   folder; `h`/Backspace closes the folder; `i`/`a` go back to the editor; `q`
@@ -216,8 +219,7 @@ Exocortex's sidebar keys work on files too:
 A file with unsaved changes isn't deleted, renamed or moved (save it first);
 open buffers follow a rename or move, with their undo history, and language
 servers are told. Not carried over: Exocortex's reordering (`e`/`E`), pins,
-stars and unwrap (`x`), which have no meaning for a sorted file tree, and
-`Ctrl+J`/`Ctrl+K` (they move lines here; Tab switches focus).
+stars and unwrap (`x`), which have no meaning for a sorted file tree.
 
 Scrolling the sidebar jumps rather than glides. It is a feature flag,
 `g:yeyito_sidebar_smooth_scroll` (off; read on every scroll, so `:let

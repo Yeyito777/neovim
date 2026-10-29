@@ -74,6 +74,13 @@ check("border unfocused", vim.wo[side].winhighlight:find("WinSeparator:YeyitoSid
   or vim.wo[side].winhighlight:find("WinSeparator:YeyitoSidebarBorder$") ~= nil)
 keys("<Tab>")
 check("Tab goes back to the sidebar", api.nvim_get_current_win() == side)
+keys("<C-j>")
+check("Ctrl+J: to the editor", api.nvim_get_current_win() == editor)
+keys("<C-k>")
+check("Ctrl+K: back to the sidebar", api.nvim_get_current_win() == side)
+keys("<C-k>")
+check("Ctrl+K from the sidebar: to the editor (either one switches)", api.nvim_get_current_win() == editor)
+keys("<C-j>")
 
 -- Files that appear on disk show up by themselves.
 vim.fn.writefile({ "x" }, dir .. "/new.txt")
@@ -94,6 +101,14 @@ vim.cmd.edit(dir .. "/.env")
 keys("<C-o>")
 keys("<Tab>")
 check("Tab without the sidebar is CTRL-I", vim.fs.basename(api.nvim_buf_get_name(0)) == ".env", api.nvim_buf_get_name(0))
+-- Without it, Ctrl+J / Ctrl+K move the line, as before.
+vim.cmd.enew()
+api.nvim_buf_set_lines(0, 0, -1, false, { "one", "two", "three" })
+keys("gg<C-j>")
+check("Ctrl+J without the sidebar moves the line down", vim.deep_equal(api.nvim_buf_get_lines(0, 0, -1, false), { "two", "one", "three" }))
+keys("<C-k>")
+check("Ctrl+K moves it back up", vim.deep_equal(api.nvim_buf_get_lines(0, 0, -1, false), { "one", "two", "three" }))
+vim.cmd("bwipeout!")
 
 -- :q in the last editor window does not leave the sidebar alone.
 vim.cmd("tabnew")
