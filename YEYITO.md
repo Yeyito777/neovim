@@ -274,6 +274,8 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
 - One conversation per project (the working directory), hidden from the
   Exocortex sidebar, kept until it has been idle an hour (a Neovim started
   meanwhile picks it up). **`:Ai new`** starts a fresh one.
+- An Exocortex daemon restart while it works is a pause, not an error: the
+  client reconnects and the request carries on when the daemon is back.
 
 Its tools: `read_file` (what the editor has, unsaved changes too),
 `edit_file`, `write_file`, `move_path`, `delete_path`, all run by Neovim,
