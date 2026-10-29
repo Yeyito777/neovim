@@ -176,7 +176,8 @@ else
   check("the card says what it's doing, then the reply", saw_working and (card_lines()[1] or ""):find("✓") ~= nil
     and (card_lines()[2] or ""):find("Created made.txt", 1, true) ~= nil, card_lines())
   local state = vim.json.decode(table.concat(vim.fn.readfile(vim.fn.stdpath("state") .. "/ai.json"), ""))
-  check("the project's conversation is remembered", type(state[dir]) == "string")
+  -- The project as Neovim sees it (on macOS /var/folders is /private/var/folders).
+  check("the project's conversation is remembered", type(state[vim.fs.normalize(vim.fn.getcwd())]) == "string", state)
   done = nil
   ai.ask("count")
   vim.wait(10000, function()
