@@ -160,6 +160,10 @@ and prompts stay to its right (see [Command line and messages](#command-line-and
   shell or an agent show up by themselves. `.git` is hidden; dotfiles show.
 - The editor's current file is bold. `:q` in the last editor window quits
   rather than leaving the sidebar alone.
+- A closed folder shows how many files it holds, everything inside it, as
+  Exocortex counts a folder's conversations (`📁 src/ 42`; `9999+` past
+  that). They are counted in the background; `g:yeyito_sidebar_counts =
+  v:false` turns them off.
 
 Like Exocortex's sidebar it has its own command line, in its bottom row
 (beside the editor's):
@@ -208,6 +212,12 @@ Exocortex's sidebar keys work on files too:
   folder.
 - **`v`** / **`V`** select rows: `dd`, `F`, `<` and `f` (a new folder, with
   the selection moved into it) act on all of them.
+- **`e`** / **`E`**: move the file or folder up / down one in its folder;
+  **Ctrl+E**: to its top (above folders too). With rows selected (`V`), they
+  move together and stay selected. The folder keeps that order, across
+  sessions (`sidebar-order.json` in Neovim's state folder); a new file goes
+  where the alphabetical order puts it, after its neighbour, and a renamed
+  one keeps its place.
 - **`;`** or a right click: the actions menu beside the row (Rename,
   Duplicate, Move, Copy path, Delete, which asks "You sure?"; on a folder
   also New file and New folder). `j`/`k`, Enter or a click, Esc.
@@ -218,8 +228,7 @@ Exocortex's sidebar keys work on files too:
 
 A file with unsaved changes isn't deleted, renamed or moved (save it first);
 open buffers follow a rename or move, with their undo history, and language
-servers are told. Not carried over: Exocortex's reordering (`e`/`E`), pins,
-stars and unwrap (`x`), which have no meaning for a sorted file tree.
+servers are told. Not carried over: pins, stars and unwrap (`x`).
 
 Scrolling the sidebar jumps rather than glides. It is a feature flag,
 `g:yeyito_sidebar_smooth_scroll` (off; read on every scroll, so `:let
@@ -259,7 +268,8 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
   left for you to save), files it makes show in the sidebar.
 - **Undo**: one `u` in a buffer undoes a request's edits there; `u` in the
   sidebar undoes the files it created, moved or deleted (to the trash).
-- Its reply shows in the card (`code` as in Exocortex); Esc puts it away.
+- Its reply shows in the card (`code` as in Exocortex); Esc puts it away
+  (in any mode, wherever you are).
   **`:Ai log`** shows this session's requests, what it did and the replies.
 - One conversation per project (the working directory), hidden from the
   Exocortex sidebar, kept until it has been idle an hour (a Neovim started

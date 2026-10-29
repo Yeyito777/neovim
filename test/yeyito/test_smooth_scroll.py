@@ -188,12 +188,14 @@ def main():
     try:
         t.read(1.0)
         t.keys(b"\x13")  # CTRL-S
-        out = t.keys(b"gg") + t.keys(b"\x05")
+        # In the sidebar CTRL-E moves an entry to the top of its folder (as in
+        # Exocortex), so it scrolls with CTRL-D / CTRL-Y here.
+        out = t.keys(b"gg") + t.keys(b"\x04")
         check("sidebar does not glide by default", glides(out) == [] and b"file" in out, repr(out[-300:]))
         t.keys(b":let g:yeyito_sidebar_smooth_scroll = v:true\r")
-        check("sidebar glides with the flag on", glides(t.keys(b"\x05")) == [1000])
+        check("sidebar glides with the flag on", glides(t.keys(b"\x19")) == [-1000])
         t.keys(b":let g:yeyito_sidebar_smooth_scroll = v:false\r")
-        check("flag off again: sidebar jumps", glides(t.keys(b"\x05")) == [])
+        check("flag off again: sidebar jumps", glides(t.keys(b"\x19")) == [])
         t.keys(b"\t")  # to the editor
         check("editor beside the sidebar still glides", glides(t.keys(b"gg\x05")) == [1000])
         check("marker never reaches the terminal (sidebar)", b"nvim-glide" not in t.log)

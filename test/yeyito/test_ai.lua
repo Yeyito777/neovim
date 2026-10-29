@@ -129,6 +129,17 @@ for _, m in ipairs(api.nvim_buf_get_extmarks(card_buf, api.nvim_create_namespace
 end
 check("the card: code spans stay whole when it wraps, without backticks", not text:find("`")
   and vim.deep_equal(code, { "add", "calc.py", "a + b", "a - b", "add", "mul" }), { text, code })
+ai._show("done", "I moved it into `done/exocortex-daemon-as-a-dependency-and-some-more.md`. Also `main.md`.")
+text = table.concat(api.nvim_buf_get_lines(card_buf, 1, -1, false), "")
+code = {}
+for _, m in ipairs(api.nvim_buf_get_extmarks(card_buf, api.nvim_create_namespace("yeyito.ai.working"), 1, -1, { details = true })) do
+  if m[4].hl_group == "YeyitoAiCode" then
+    code[#code + 1] = api.nvim_buf_get_text(card_buf, m[2], m[3], m[2], m[4].end_col, {})[1]
+  end
+end
+check("a code span longer than a line: broken, still highlighted, no backticks", not text:find("`")
+  and table.concat(code, "", 1, #code - 1) == "done/exocortex-daemon-as-a-dependency-and-some-more.md" and code[#code] == "main.md",
+  { text, code })
 
 -- End to end, with the fake daemon.
 local exo_dir
@@ -206,9 +217,12 @@ else
     return done ~= nil
   end, 10)
   check(":Ai new starts a fresh conversation", done and done.text == "turns: 1", done)
-  api.nvim_feedkeys(api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+  -- In the sidebar, whose own Esc mapping hides the key from the card.
+  require("yeyito.sidebar").open()
+  api.nvim_feedkeys(api.nvim_replace_termcodes("<Esc>", true, false, true), "xt", false)
   vim.wait(200)
-  check("Esc puts the card away", not (ai._card.win and api.nvim_win_is_valid(ai._card.win)))
+  require("yeyito.sidebar").close()
+  check("Esc puts the card away (even in the sidebar)", not (ai._card.win and api.nvim_win_is_valid(ai._card.win)))
   pcall(function()
     proc:kill("sigterm")
   end)

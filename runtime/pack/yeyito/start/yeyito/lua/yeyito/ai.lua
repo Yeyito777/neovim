@@ -325,6 +325,7 @@ local function tools(root, turn)
         if not ok then
           error(err, 0)
         end
+        require("yeyito.sidebar").moved(from, to)
         require("yeyito.sidebar").changed(to)
         did("moved " .. rel(root, from) .. " → " .. rel(root, to))
         return "Moved " .. rel(root, from) .. " to " .. rel(root, to)
@@ -480,36 +481,91 @@ local function model_label()
   return name and (name:sub(1, 1):upper() .. name:sub(2) .. " " .. major .. "." .. minor) or vim.g.yeyito_ai_model
 end
 
---- `text` cut into lines of at most `width` columns, at spaces where it can.
-local function wrap(text, width)
-  local out = {}
-  for _, para in ipairs(vim.split(text, "\n", { plain = true })) do
-    local line = ""
-    for word in para:gmatch("%S+") do
-      while vim.fn.strdisplaywidth(word) > width do
-        if line ~= "" then
-          out[#out + 1] = line
-          line = ""
-        end
-        local cut = vim.fn.strcharpart(word, 0, width)
-        out[#out + 1] = cut
-        word = word:sub(#cut + 1)
-      end
-      if line == "" then
-        line = word
-      elseif vim.fn.strdisplaywidth(line .. " " .. word) <= width then
-        line = line .. " " .. word
-      else
-        out[#out + 1] = line
-        line = word
+--- `text` laid out in lines of at most `width` columns, broken at spaces;
+--- `code` spans lose their backticks and are returned as { line, from, to }
+--- (byte columns) to colour. A code span is kept on one line when it fits,
+--- else broken like the rest.
+local function layout(text, width)
+  local parts, code, len, from = {}, {}, 0, 1
+  while true do
+    local s, e = text:find("`[^`\n]+`", from)
+    local plain = text:sub(from, s and s - 1 or #text)
+    parts[#parts + 1], len = plain, len + #plain
+    if not s then
+      break
+    end
+    local inner = text:sub(s + 1, e - 1)
+    code[#code + 1] = { len + 1, len + #inner }
+    parts[#parts + 1], len = inner, len + #inner
+    from = e + 1
+  end
+  local clean = table.concat(parts)
+  local function in_code(i)
+    for _, r in ipairs(code) do
+      if i >= r[1] and i <= r[2] then
+        return true
       end
     end
-    out[#out + 1] = line
+    return false
   end
-  while #out > 0 and out[#out] == "" do
-    out[#out] = nil
+  local lines, spans = {}, {}
+  local function emit(a, b)
+    lines[#lines + 1] = clean:sub(a, b)
+    for _, r in ipairs(code) do
+      local s, e = math.max(r[1], a), math.min(r[2], b)
+      if s <= e then
+        spans[#spans + 1] = { #lines, s - a, e - a + 1 }
+      end
+    end
   end
-  return out
+  local start = 1
+  while true do
+    local nl = clean:find("\n", start, true)
+    local stop = nl and nl - 1 or #clean
+    local p = start
+    if p > stop then
+      emit(p, p - 1) -- an empty line
+    end
+    while p <= stop do
+      if vim.fn.strdisplaywidth(clean:sub(p, stop)) <= width then
+        emit(p, stop)
+        break
+      end
+      -- The last space that fits, outside a code span if there is one.
+      local best, any
+      for i = p + 1, stop do
+        if clean:sub(i, i) == " " then
+          if vim.fn.strdisplaywidth(clean:sub(p, i - 1)) > width then
+            break
+          end
+          any = i
+          if not in_code(i) then
+            best = i
+          end
+        end
+      end
+      local cut = best or any
+      if cut then
+        emit(p, cut - 1)
+        p = cut + 1
+      else -- one word wider than the line: cut it
+        local piece = vim.fn.strcharpart(clean:sub(p, stop), 0, width)
+        emit(p, p + #piece - 1)
+        p = p + #piece
+      end
+      while clean:sub(p, p) == " " and p <= stop do
+        p = p + 1
+      end
+    end
+    if not nl then
+      break
+    end
+    start = nl + 1
+  end
+  while #lines > 0 and lines[#lines] == "" do
+    lines[#lines] = nil
+  end
+  return lines, spans
 end
 
 local MAX_LINES = 14
@@ -524,37 +580,28 @@ local function draw_card()
   else
     head = "✓ " .. model_label()
   end
-  local body = {}
-  local nbsp = "\194\160"
-  for _, line in ipairs(card.lines) do
-    -- A `code span` isn't broken across lines (its backticks stay together).
-    line = line:gsub("`[^`\n]+`", function(span)
-      return (span:gsub(" ", nbsp))
-    end)
-    for _, l in ipairs(wrap(line, width - 2)) do
-      body[#body + 1] = (l:gsub(nbsp, " "))
+  local body, spans = {}, {}
+  for _, text in ipairs(card.lines) do
+    local lines, sp = layout(text, width - 2)
+    for _, x in ipairs(sp) do
+      spans[#spans + 1] = { x[1] + #body, x[2], x[3] }
     end
+    vim.list_extend(body, lines)
   end
   if #body > MAX_LINES then
     body = vim.list_slice(body, 1, MAX_LINES - 1)
     body[#body + 1] = "… :Ai log shows it all"
+    spans = vim.tbl_filter(function(x)
+      return x[1] < MAX_LINES
+    end, spans)
   end
+  -- The lines with a space in front; `code` in a colour of its own.
   local lines = { " " .. vim.fn.strcharpart(head, 0, width - 2) }
-  -- `code` in the reply: without the backticks, in a colour of its own.
-  local spans = {}
-  for i, l in ipairs(body) do
-    local text, from = " ", 1
-    while true do
-      local s, e = l:find("`[^`]+`", from)
-      if not s then
-        break
-      end
-      text = text .. l:sub(from, s - 1)
-      spans[#spans + 1] = { i, #text, #text + (e - s - 1) }
-      text = text .. l:sub(s + 1, e - 1)
-      from = e + 1
-    end
-    lines[#lines + 1] = text .. l:sub(from)
+  for _, l in ipairs(body) do
+    lines[#lines + 1] = " " .. l
+  end
+  for _, x in ipairs(spans) do
+    x[2], x[3] = x[2] + 1, x[3] + 1
   end
   if not (card.buf and api.nvim_buf_is_valid(card.buf)) then
     card.buf = api.nvim_create_buf(false, true)
@@ -876,9 +923,10 @@ function M.setup()
   vim.keymap.set({ "n", "i", "x" }, "<C-q>", function()
     return M.stop() and "" or "<C-q>"
   end, { expr = true, desc = "Stop the AI" })
-  -- Esc in normal mode puts the reply card away.
-  vim.on_key(function(key)
-    if card.win and card.kind ~= "working" and key == "\27" and api.nvim_get_mode().mode == "n" then
+  -- Esc puts the reply card away, whatever mode and window (as typed: the
+  -- sidebar's own Esc mapping would hide it otherwise).
+  vim.on_key(function(key, typed)
+    if card.win and card.kind ~= "working" and (typed == "\27" or key == "\27") then
       vim.schedule(close_card)
     end
   end, working_ns)

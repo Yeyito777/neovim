@@ -26,6 +26,7 @@
 --   f        new folder      r  rename      c  duplicate
 --   F        move to a folder (Tab completes)       <  move out of its folder
 --   v V      select rows: d, F, f (a new folder for them) and < act on them
+--   e E      move up / down in its folder; Ctrl+E to its top (kept, as in Exocortex)
 --   ;        or a right click: the actions menu
 local M = {}
 
@@ -43,6 +44,13 @@ local root ---@type string?
 local buf ---@type integer?
 local expanded = {} ---@type table<string, true>
 local children = {} ---@type table<string, {name: string, path: string, dir: boolean}[]>
+-- e / E / Ctrl+E: a folder's own order, kept across sessions: folder -> names.
+local order_file = vim.fn.stdpath("state") .. "/sidebar-order.json"
+local order ---@type table<string, string[]>?
+-- How many files a closed folder holds (everything inside it, as Exocortex
+-- counts a folder's conversations), counted in the background.
+local counts = {} ---@type table<string, integer>
+local count_queued = {} ---@type table<string, true>
 local rows = {} ---@type {name: string, path: string, dir: boolean, depth: integer}[]
 local watchers = {} ---@type table<string, uv.uv_fs_event_t>
 local main_win = {} ---@type table<integer, integer> tabpage -> editor window files open in
@@ -113,6 +121,98 @@ end
 
 -- ── Tree ──────────────────────────────────────────────────────────────────
 
+local function load_order()
+  if not order then
+    local data
+    local f = io.open(order_file, "r")
+    if f then
+      local ok, decoded = pcall(vim.json.decode, f:read("*a"))
+      f:close()
+      data = ok and type(decoded) == "table" and decoded or nil
+    end
+    order = data or {}
+  end
+  return order
+end
+
+local function save_order()
+  vim.fn.mkdir(vim.fs.dirname(order_file), "p")
+  local f = io.open(order_file, "w")
+  if f then
+    f:write(vim.json.encode(load_order()))
+    f:close()
+  end
+end
+
+--- `list` (sorted) in the folder's own order: the names it has, in that
+--- order; others (new files) where the sort puts them, after the entry the
+--- sort has before them.
+local function apply_order(dir, list)
+  local names = load_order()[dir]
+  if not names then
+    return list
+  end
+  local by_name, out, placed = {}, {}, {}
+  for _, e in ipairs(list) do
+    by_name[e.name] = e
+  end
+  for _, n in ipairs(names) do
+    local e = by_name[n]
+    if e and not placed[n] then
+      out[#out + 1], placed[n] = e, true
+    end
+  end
+  for i, e in ipairs(list) do
+    if not placed[e.name] then
+      local at = 0
+      for j, x in ipairs(out) do
+        if x == list[i - 1] then
+          at = j
+          break
+        end
+      end
+      table.insert(out, at + 1, e)
+      placed[e.name] = true
+    end
+  end
+  return out
+end
+
+--- A file or folder moved (renamed): its place in its folder's order, and
+--- the orders of the folders in it, follow.
+local function order_moved(from, to)
+  local o, changed = load_order(), false
+  local parent = vim.fs.dirname(from)
+  if parent == vim.fs.dirname(to) and o[parent] then
+    for i, n in ipairs(o[parent]) do
+      if n == vim.fs.basename(from) then
+        o[parent][i], changed = vim.fs.basename(to), true
+      end
+    end
+  end
+  local keys = {}
+  for key in pairs(o) do
+    if key == from or vim.startswith(key, from .. "/") then
+      keys[#keys + 1] = key
+    end
+  end
+  for _, key in ipairs(keys) do
+    o[to .. key:sub(#from + 1)], o[key], changed = o[key], nil, true
+  end
+  if changed then
+    save_order()
+  end
+end
+
+function M.moved(from, to)
+  order_moved(from, to)
+end
+
+--- Keep the order in `path` instead (tests), read again from there.
+function M._order_file(path)
+  order_file, order = path or vim.fn.stdpath("state") .. "/sidebar-order.json", nil
+end
+
 local function scan(dir)
   local list = {}
   local handle = uv.fs_scandir(dir)
@@ -141,6 +241,7 @@ local function scan(dir)
     end
     return a.name < b.name
   end)
+  list = apply_order(dir, list)
   children[dir] = list
   return list
 end
@@ -321,6 +422,105 @@ local function walk(job, kids, done)
     end
   end
   next_folders()
+end
+
+-- ── File counts of closed folders ─────────────────────────────────────────
+
+local COUNT_MAX = 9999
+local count_list, counting = {}, false
+local count_timer ---@type uv.uv_timer_t?
+local render
+
+--- Count the files under the queued folders, a folder at a time, listing its
+--- folders off the main thread (as the search index does); at most COUNT_MAX.
+local function next_count()
+  if counting then
+    return
+  end
+  local dir = table.remove(count_list, 1)
+  if not dir then
+    return
+  end
+  counting = true
+  local total, queue, head, busy, finished = 0, { dir }, 1, 0, false
+  local step
+  local function finish()
+    finished = true
+    counts[dir], count_queued[dir], counting = total, nil, false
+    count_timer = count_timer or uv.new_timer()
+    count_timer:stop()
+    count_timer:start(60, 0, vim.schedule_wrap(function()
+      render()
+    end))
+    vim.schedule(next_count)
+  end
+  step = function()
+    if finished then
+      return
+    end
+    while busy < SCANS and queue[head] and total < COUNT_MAX do
+      local d = queue[head]
+      head, busy = head + 1, busy + 1
+      local settled = false
+      local timer = uv.new_timer()
+      timer:start(SCAN_TIMEOUT, 0, function()
+        timer:close()
+        if not settled then
+          settled, busy = true, busy - 1
+          step()
+        end
+      end)
+      uv.fs_scandir(d, function(_, handle)
+        if settled then
+          return
+        end
+        settled, busy = true, busy - 1
+        timer:stop()
+        timer:close()
+        while handle and total < COUNT_MAX do
+          local name, kind = uv.fs_scandir_next(handle)
+          if not name then
+            break
+          end
+          if name ~= ".git" then
+            if kind == "directory" then
+              local path = d .. "/" .. name
+              if path ~= SKIP then
+                queue[#queue + 1] = path
+              end
+            else
+              total = total + 1
+            end
+          end
+        end
+        step()
+      end)
+    end
+    if busy == 0 and (not queue[head] or total >= COUNT_MAX) then
+      vim.schedule(function()
+        if not finished then
+          finish()
+        end
+      end)
+    end
+  end
+  step()
+end
+
+local function queue_count(dir)
+  if count_queued[dir] or dir == SKIP then
+    return
+  end
+  count_queued[dir] = true
+  count_list[#count_list + 1] = dir
+  next_count()
+end
+
+--- Count the folders on show again (their numbers stay until the new ones land).
+local function recount()
+  for dir in pairs(counts) do
+    queue_count(dir)
+  end
 end
 
 --- The entries in tree order: each folder's contents sorted as the tree
@@ -641,7 +841,11 @@ local function label(row)
     return (row.dir and "📁 " or "") .. truncate_left(printable(row.rel) .. (row.dir and "/" or ""), WIDTH - 3 - (row.dir and 3 or 0))
   end
   if row.dir then
-    return (expanded[row.path] and "📂 " or "📁 ") .. printable(row.name) .. "/"
+    if expanded[row.path] then -- its files are listed right below
+      return "📂 " .. printable(row.name) .. "/"
+    end
+    local n = vim.g.yeyito_sidebar_counts and counts[row.path]
+    return "📁 " .. printable(row.name) .. "/" .. (n and " " .. (n >= COUNT_MAX and "9999+" or n) or "")
   end
   return printable(row.name)
 end
@@ -742,7 +946,7 @@ local function highlight_matches()
   })
 end
 
-local function render(keep_path)
+function render(keep_path)
   if not (buf and api.nvim_buf_is_valid(buf)) then
     return
   end
@@ -750,6 +954,13 @@ local function render(keep_path)
   keep_path = keep_path or (win and (cursor_row(win) or {}).path)
   ellipsis = vim.fn.strdisplaywidth("…")
   build()
+  if vim.g.yeyito_sidebar_counts then
+    for _, row in ipairs(rows) do
+      if row.dir and not row.rel and not expanded[row.path] and counts[row.path] == nil then
+        queue_count(row.path)
+      end
+    end
+  end
   local lines = {}
   local target
   for i, row in ipairs(rows) do
@@ -793,6 +1004,7 @@ function refresh(soon)
   end
   if not soon then
     children = {}
+    recount()
     render()
     return
   end
@@ -1342,6 +1554,7 @@ end
 --- The tree after an operation, with `select` selected (its folders opened).
 local function after_change(select)
   children = {} -- read again
+  recount()
   if active_query() then
     start_index() -- the filtered list comes from the index: it shows the change when the new one lands
     render(select)
@@ -1792,6 +2005,7 @@ local function rename_item(row)
       if not ok then
         return err
       end
+      order_moved(row.path, to)
       after_change(to)
     end,
   })
@@ -1873,6 +2087,80 @@ local function move_out()
     return fail(err)
   end
   after_change(moves[1].to)
+end
+
+--- e / E / Ctrl+E: move the selected rows (or the cursor's) up or down one
+--- among their folder's entries, or to its top, as Exocortex does; the folder
+--- keeps that order (in Neovim's state folder, across sessions).
+local function reorder(how)
+  local win = sidebar_win()
+  if not win or active_query() then
+    return
+  end
+  local items = targets()
+  if #items == 0 then
+    return
+  end
+  clear_pending()
+  local parent = vim.fs.dirname(items[1].path)
+  local sel = {}
+  for _, item in ipairs(items) do
+    if vim.fs.dirname(item.path) ~= parent then
+      return -- only entries of one folder move together
+    end
+    sel[item.path] = true
+  end
+  local list = vim.list_slice(children[parent] or scan(parent))
+  local function names()
+    return vim.tbl_map(function(e)
+      return e.name
+    end, list)
+  end
+  local was = table.concat(names(), "/")
+  if how == "top" then
+    local top, rest = {}, {}
+    for _, e in ipairs(list) do
+      table.insert(sel[e.path] and top or rest, e)
+    end
+    list = vim.list_extend(top, rest)
+  elseif how == "up" then
+    for i = 2, #list do
+      if sel[list[i].path] and not sel[list[i - 1].path] then
+        list[i - 1], list[i] = list[i], list[i - 1]
+      end
+    end
+  else
+    for i = #list - 1, 1, -1 do
+      if sel[list[i].path] and not sel[list[i + 1].path] then
+        list[i], list[i + 1] = list[i + 1], list[i]
+      end
+    end
+  end
+  if table.concat(names(), "/") == was then
+    return
+  end
+  load_order()[parent] = names()
+  save_order()
+  children[parent] = list
+  local cursor = (cursor_row(win) or {}).path
+  local anchor
+  if visual_mode() then
+    local a = rows[vim.fn.line("v")]
+    anchor = a and a.path
+    leave_visual()
+  end
+  render(cursor)
+  if anchor then -- the same rows selected again
+    for i, r in ipairs(rows) do
+      if r.path == anchor then
+        local at = api.nvim_win_get_cursor(win)[1]
+        api.nvim_win_set_cursor(win, { i, 0 })
+        vim.cmd("normal! V")
+        api.nvim_win_set_cursor(win, { at, 0 })
+        break
+      end
+    end
+  end
 end
 
 --- c: a copy beside it ("name copy.ext"), selected.
@@ -2132,6 +2420,15 @@ local function get_buf()
   end, "Move to a folder")
   map("<", move_out, "Move out of its folder")
   map(";", M.open_menu, "Actions menu")
+  map("e", function()
+    reorder("up")
+  end, "Move up in its folder (kept)")
+  map("E", function()
+    reorder("down")
+  end, "Move down in its folder (kept)")
+  map("<C-e>", function()
+    reorder("top")
+  end, "Move to the top of its folder (kept)")
   map("J", "j", "Next row")
   map("K", "k", "Previous row")
   map("<Esc>", clear_pending, "Cancel")
@@ -2147,6 +2444,15 @@ local function get_buf()
     move_items(items)
   end, "Move the selected rows to a folder")
   xmap("<", move_out, "Move the selected rows out of their folder")
+  xmap("e", function()
+    reorder("up")
+  end, "Move the selected rows up (kept)")
+  xmap("E", function()
+    reorder("down")
+  end, "Move the selected rows down (kept)")
+  xmap("<C-e>", function()
+    reorder("top")
+  end, "Move the selected rows to the top of their folder (kept)")
   api.nvim_create_autocmd("CursorMoved", {
     buffer = buf,
     callback = function()
@@ -2347,6 +2653,7 @@ function M.setup()
       if sidebar_win() then
         root = vim.fs.normalize(vim.fn.getcwd())
         expanded = {}
+        counts, count_queued, count_list = {}, {}, {}
         search.job = nil -- the next search indexes the new root
         refresh()
       end

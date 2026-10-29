@@ -12,6 +12,8 @@ local function keys(k)
   api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "mx", false)
 end
 
+vim.g.yeyito_sidebar_counts = false -- folder rows compared as they are; counts get their own checks
+
 local function run()
 -- A project: dirs before files, case-insensitive, .git hidden, dotfiles shown.
 local dir = vim.fs.normalize(vim.fn.tempname())
@@ -509,6 +511,9 @@ local function file_steps()
     send("<C-p>")
   end)
   step(function()
+    vim.wait(2000, function()
+      return modal_frame() ~= nil
+    end, 10)
     local frame = modal_frame()
     local cfg = frame and api.nvim_win_get_config(frame)
     check("Ctrl+P without the sidebar: the box in the middle of the screen",
@@ -526,8 +531,126 @@ local function file_steps()
   return steps
 end
 
+-- e / E / Ctrl+E reorder a folder and keep it; closed folders show their
+-- file counts.
+local function order_steps()
+  local steps = {}
+  local function step(fn)
+    steps[#steps + 1] = fn
+  end
+  local function send(k)
+    api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "m", false)
+  end
+  local S = {}
+  local sidebar = require("yeyito.sidebar")
+  local function lines()
+    return vim.tbl_map(vim.trim, api.nvim_buf_get_lines(S.buf, 0, -1, true))
+  end
+  local function selected()
+    local row = api.nvim_win_get_cursor(S.side)[1]
+    return vim.trim(api.nvim_buf_get_lines(S.buf, row - 1, row, true)[1])
+  end
+  local function select(name)
+    api.nvim_set_current_win(S.side)
+    for i, line in ipairs(lines()) do
+      if line == name then
+        api.nvim_win_set_cursor(S.side, { i, 0 })
+        return
+      end
+    end
+    error("no row " .. name)
+  end
+  step(function()
+    S.dir = vim.fs.normalize(vim.fn.tempname())
+    S.order = vim.fn.tempname() .. "-order.json"
+    sidebar._order_file(S.order)
+    vim.fn.mkdir(S.dir .. "/lib/deep", "p")
+    for _, f in ipairs({ "a.txt", "b.txt", "c.txt", "lib/x.txt", "lib/deep/y.txt" }) do
+      vim.fn.writefile({ "x" }, S.dir .. "/" .. f)
+    end
+    vim.cmd("tabnew")
+    vim.cmd.cd(S.dir)
+    vim.cmd.edit("a.txt")
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    select("c.txt")
+    send("e")
+  end)
+  step(function()
+    check("e: up one in its folder", vim.deep_equal(lines(), { "📁 lib/", "a.txt", "c.txt", "b.txt" }) and selected() == "c.txt", lines())
+    send("e<C-e>")
+  end)
+  step(function()
+    check("Ctrl+E: to the top (above folders too)", vim.deep_equal(lines(), { "c.txt", "📁 lib/", "a.txt", "b.txt" }), lines())
+    local saved = vim.json.decode(table.concat(vim.fn.readfile(S.order), ""))
+    check("the order is kept on disk", vim.deep_equal(saved[vim.fs.normalize(vim.fn.getcwd())], { "c.txt", "lib", "a.txt", "b.txt" }), saved)
+    send("E")
+  end)
+  step(function()
+    check("E: down one", vim.deep_equal(lines(), { "📁 lib/", "c.txt", "a.txt", "b.txt" }) and selected() == "c.txt", lines())
+    select("a.txt")
+    send("Vj")
+  end)
+  step(function()
+    send("e")
+  end)
+  step(function()
+    check("v + e: the selection moves together, still selected", vim.deep_equal(lines(), { "📁 lib/", "a.txt", "b.txt", "c.txt" })
+      and api.nvim_get_mode().mode == "V" and vim.fn.line("v") == 2 and vim.fn.line(".") == 3, { lines(), api.nvim_get_mode() })
+    send("<Esc>")
+  end)
+  step(function()
+    select("c.txt")
+    send("<C-e>")
+  end)
+  step(function()
+    vim.fn.writefile({ "x" }, S.dir .. "/bb.txt")
+    send("R")
+  end)
+  step(function()
+    check("a new file goes where the sort puts it, after its neighbour", vim.deep_equal(lines(), { "c.txt", "📁 lib/", "a.txt", "b.txt", "bb.txt" }), lines())
+    sidebar._order_file(S.order) -- read again from the file
+    sidebar.close()
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    check("the order comes back (from disk)", vim.deep_equal(lines(), { "c.txt", "📁 lib/", "a.txt", "b.txt", "bb.txt" }), lines())
+    select("c.txt")
+    send("r")
+  end)
+  step(function()
+    send("<C-u>z.txt<CR>")
+  end)
+  step(function()
+    check("a renamed file keeps its place", lines()[1] == "z.txt", lines())
+    vim.g.yeyito_sidebar_counts = true
+    send("R")
+  end)
+  step(function()
+    vim.wait(3000, function()
+      return vim.tbl_contains(lines(), "📁 lib/ 2")
+    end, 20)
+    check("a closed folder shows how many files it holds (all the way down)", vim.tbl_contains(lines(), "📁 lib/ 2"), lines())
+    select("📁 lib/ 2")
+    send("<CR>")
+  end)
+  step(function()
+    vim.wait(3000, function()
+      return vim.tbl_contains(lines(), "📁 deep/ 1")
+    end, 20)
+    check("an open folder doesn't (its files are listed)", vim.tbl_contains(lines(), "📂 lib/")
+      and vim.tbl_contains(lines(), "📁 deep/ 1"), lines())
+    vim.g.yeyito_sidebar_counts = false
+    sidebar._order_file(nil)
+    vim.fn.delete(S.dir, "rf")
+    os.remove(S.order)
+    vim.cmd("tabclose")
+  end)
+  return steps
+end
+
 local steps = search_steps()
 vim.list_extend(steps, file_steps())
+vim.list_extend(steps, order_steps())
 local function next_step(i)
   if i > #steps then
     io.stdout:write(failures .. " failure(s)\n")
