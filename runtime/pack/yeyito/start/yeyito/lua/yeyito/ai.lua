@@ -7,8 +7,11 @@
 --                    about the selected text)
 --   :Ai [request]    the same from the command line (:ai too; with a range,
 --                    about those lines); :Ai new  a fresh conversation;
---                    :Ai log  this session's requests and replies
+--                    :Ai log  this session's requests and replies;
+--                    :Ai clear  no more green on the lines it changed
 --   Ctrl+Q           stop it while it works
+--   Esc              in normal mode: put its reply away, then the green block
+--                    under the cursor
 -- One conversation per project (the working directory), hidden from the
 -- Exocortex sidebar, kept until it has been idle an hour.
 local M = {}
@@ -94,6 +97,38 @@ local function watch(buf)
       watched[b] = nil
     end,
   })
+end
+
+--- The green block on `row` goes (marks that touch count as one block).
+local function clear_block(buf, row)
+  if not api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local marks = api.nvim_buf_get_extmarks(buf, changed_ns, 0, -1, { details = true })
+  local first, last, hit, grew = row, row, {}, true
+  while grew do
+    grew = false
+    local reach = next(hit) and 1 or 0
+    for _, m in ipairs(marks) do
+      local top, bottom = m[2], m[4].end_row or m[2]
+      if not hit[m[1]] and top <= last + reach and bottom >= first - reach then
+        hit[m[1]], grew = true, true
+        first, last = math.min(first, top), math.max(last, bottom)
+      end
+    end
+  end
+  for id in pairs(hit) do
+    api.nvim_buf_del_extmark(buf, changed_ns, id)
+  end
+end
+
+--- :Ai clear: no more green, in any file.
+function M.clear_changes()
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if api.nvim_buf_is_loaded(b) then
+      api.nvim_buf_clear_namespace(b, changed_ns, 0, -1)
+    end
+  end
 end
 
 local function split(text)
@@ -923,20 +958,27 @@ function M.setup()
   vim.keymap.set({ "n", "i", "x" }, "<C-q>", function()
     return M.stop() and "" or "<C-q>"
   end, { expr = true, desc = "Stop the AI" })
-  -- Esc puts the reply card away when pressed in normal mode (this runs before
-  -- the key does, so the mode is the one it was pressed in) and it has nothing
-  -- else to do: not leaving insert or visual mode, closing a box or menu (a
-  -- float), or cancelling a sidebar delete. `typed`: the sidebar maps Esc.
+  -- Esc pressed in normal mode (this runs before the key does, so the mode is
+  -- the one it was pressed in) with nothing else to do (not leaving insert or
+  -- visual mode, closing a box or menu, a float, or cancelling a sidebar
+  -- delete) puts the reply card away, else the green block under the cursor.
+  -- `typed`: the sidebar maps Esc.
   vim.on_key(function(_, typed)
     if
-      card.win
-      and card.kind ~= "working"
-      and typed == "\27"
-      and api.nvim_get_mode().mode == "n"
-      and api.nvim_win_get_config(0).relative == ""
-      and not require("yeyito.sidebar").delete_pending()
+      typed ~= "\27"
+      or api.nvim_get_mode().mode ~= "n"
+      or api.nvim_win_get_config(0).relative ~= ""
+      or require("yeyito.sidebar").delete_pending()
     then
+      return
+    end
+    if card.win and card.kind ~= "working" then
       vim.schedule(close_card)
+    else
+      local buf, row = api.nvim_get_current_buf(), api.nvim_win_get_cursor(0)[1] - 1
+      vim.schedule(function()
+        clear_block(buf, row)
+      end)
     end
   end, working_ns)
   api.nvim_create_user_command("Ai", function(o)
@@ -944,6 +986,8 @@ function M.setup()
       return M.reset()
     elseif o.args == "log" then
       return M.show_log()
+    elseif o.args == "clear" then
+      return M.clear_changes()
     end
     local sel = o.range > 0 and selection(o.line1, o.line2) or nil
     if o.args == "" then
@@ -953,11 +997,11 @@ function M.setup()
   end, {
     nargs = "*",
     range = true,
-    desc = "Ask the AI (Exocortex): :Ai request, :Ai new, :Ai log",
+    desc = "Ask the AI (Exocortex): :Ai request, :Ai new, :Ai log, :Ai clear",
     complete = function(lead)
       return vim.tbl_filter(function(c)
         return vim.startswith(c, lead)
-      end, { "new", "log" })
+      end, { "new", "log", "clear" })
     end,
   })
   -- :ai works too.

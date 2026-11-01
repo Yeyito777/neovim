@@ -271,7 +271,8 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
   says what it's doing (`⠋ Sonnet 5.5 · editing src/main.c`). Keep editing
   meanwhile; **Ctrl+Q** stops it (otherwise Ctrl+Q is what it was).
 - Its changes land at once: edited lines are tinted green until you edit
-  them, files are saved (a file with your own unsaved changes is edited but
+  them or clear them (Esc in normal mode on a green block clears that block,
+  once the reply card is gone; `:Ai clear` clears all of them), files are saved (a file with your own unsaved changes is edited but
   left for you to save), files it makes show in the sidebar.
 - **Undo**: one `u` in a buffer undoes a request's edits there; `u` in the
   sidebar undoes the files it created, moved or deleted (to the trash).

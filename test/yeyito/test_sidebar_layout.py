@@ -211,6 +211,17 @@ def main():
         check("reply card: stays when Esc leaves insert mode", card() is True)
         t.keys(b"\x1b", idle=0.3)
         check("reply card: Esc in normal mode puts it away", card() is False)
+        # And the green on a line the AI changed: st's Esc, on the real screen.
+        col = expr("json_encode(getwininfo(win_getid())[0].textoff + 1)")
+        before = expr("json_encode(screenattr(1, %d))" % col)
+        expr("json_encode(luaeval('vim.api.nvim_buf_set_extmark(0, vim.api.nvim_create_namespace(\"yeyito.ai.changed\"),"
+             " 0, 0, { line_hl_group = \"YeyitoAiChanged\" })'))")
+        t.read(0.3)
+        green = expr("json_encode(screenattr(1, %d))" % col)
+        t.keys(b"\x1b", idle=0.3)
+        after = expr("json_encode(screenattr(1, %d))" % col)
+        check("Esc on a green line takes the green off the screen", green != before and after == before,
+              (before, green, after))
     finally:
         t.close()
 

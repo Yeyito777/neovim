@@ -117,6 +117,40 @@ files.undo()
 check("u in the sidebar puts it back", exists("docs/notes.md"))
 check("what it did is listed for :Ai log", true)
 
+-- The green goes when you say so: Esc in normal mode on a block, or :Ai clear.
+vim.fn.writefile({ "a", "b", "c", "d", "e", "f" }, dir .. "/green.txt")
+vim.cmd.edit(dir .. "/green.txt")
+t = run_tools()
+t.edit_file({ path = "green.txt", old_string = "b", new_string = "B" })
+t.edit_file({ path = "green.txt", old_string = "c", new_string = "C" }) -- touches b's: one block
+t.edit_file({ path = "green.txt", old_string = "e", new_string = "E" })
+local function green()
+  local out = {}
+  for _, m in ipairs(api.nvim_buf_get_extmarks(0, changed_ns, 0, -1, {})) do
+    out[#out + 1] = m[2] + 1
+  end
+  return out
+end
+local function typed_keys(k)
+  api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "xt", false)
+  vim.wait(50)
+end
+check("three green lines", vim.deep_equal(green(), { 2, 3, 5 }), green())
+api.nvim_win_set_cursor(0, { 1, 0 })
+typed_keys("<Esc>")
+check("Esc off a green block clears nothing", vim.deep_equal(green(), { 2, 3, 5 }), green())
+api.nvim_win_set_cursor(0, { 3, 0 })
+typed_keys("v<Esc>")
+check("the Esc that leaves visual mode clears nothing", vim.deep_equal(green(), { 2, 3, 5 }), green())
+ai._show("done", "a reply")
+typed_keys("<Esc>")
+check("Esc puts the reply card away first", vim.deep_equal(green(), { 2, 3, 5 })
+  and not api.nvim_win_is_valid(ai._card.win or -1), green())
+typed_keys("<Esc>")
+check("then Esc on a green block clears that block", vim.deep_equal(green(), { 5 }), green())
+vim.cmd("Ai clear")
+check(":Ai clear clears the rest", vim.deep_equal(green(), {}), green())
+
 -- The card: `code` keeps its backticks together when the reply wraps.
 ai._show("done", "I changed `add` in `calc.py` to return `a + b` instead of `a - b`, and gave both `add` and `mul` docstrings.")
 local card_buf = ai._card.buf
