@@ -275,8 +275,9 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
   left for you to save), files it makes show in the sidebar.
 - **Undo**: one `u` in a buffer undoes a request's edits there; `u` in the
   sidebar undoes the files it created, moved or deleted (to the trash).
-- Its reply shows in the card (`code` as in Exocortex); Esc puts it away
-  (in any mode, wherever you are).
+- Its reply shows in the card (`code` as in Exocortex). Esc in normal mode
+  puts it away; the Esc that leaves insert or visual mode, closes a box or
+  menu, or cancels a sidebar `d` leaves it up.
   **`:Ai log`** shows this session's requests, what it did and the replies.
 - One conversation per project (the working directory), hidden from the
   Exocortex sidebar, kept until it has been idle an hour (a Neovim started

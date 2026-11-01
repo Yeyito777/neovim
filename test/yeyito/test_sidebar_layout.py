@@ -198,6 +198,22 @@ def main():
     finally:
         t.close()
 
+    # st's Esc and the AI's reply card: it stays up until Esc in normal mode.
+    t, layout, expr = run()
+    try:
+        expr("json_encode(luaeval('require(\"yeyito.ai\")._show(\"done\", \"a reply\")'))")
+
+        def card():
+            return expr("json_encode(luaeval('(function() local w = require(\"yeyito.ai\")._card.win;"
+                        " return w ~= nil and vim.api.nvim_win_is_valid(w) end)()'))")
+        t.keys(b"i")
+        t.keys(b"\x1b", idle=0.3)
+        check("reply card: stays when Esc leaves insert mode", card() is True)
+        t.keys(b"\x1b", idle=0.3)
+        check("reply card: Esc in normal mode puts it away", card() is False)
+    finally:
+        t.close()
+
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 

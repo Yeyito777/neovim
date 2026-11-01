@@ -923,10 +923,19 @@ function M.setup()
   vim.keymap.set({ "n", "i", "x" }, "<C-q>", function()
     return M.stop() and "" or "<C-q>"
   end, { expr = true, desc = "Stop the AI" })
-  -- Esc puts the reply card away, whatever mode and window (as typed: the
-  -- sidebar's own Esc mapping would hide it otherwise).
-  vim.on_key(function(key, typed)
-    if card.win and card.kind ~= "working" and (typed == "\27" or key == "\27") then
+  -- Esc puts the reply card away when pressed in normal mode (this runs before
+  -- the key does, so the mode is the one it was pressed in) and it has nothing
+  -- else to do: not leaving insert or visual mode, closing a box or menu (a
+  -- float), or cancelling a sidebar delete. `typed`: the sidebar maps Esc.
+  vim.on_key(function(_, typed)
+    if
+      card.win
+      and card.kind ~= "working"
+      and typed == "\27"
+      and api.nvim_get_mode().mode == "n"
+      and api.nvim_win_get_config(0).relative == ""
+      and not require("yeyito.sidebar").delete_pending()
+    then
       vim.schedule(close_card)
     end
   end, working_ns)

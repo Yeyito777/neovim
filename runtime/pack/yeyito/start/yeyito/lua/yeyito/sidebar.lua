@@ -1496,6 +1496,11 @@ local function clear_pending()
   end
 end
 
+--- A row waits for the second d of dd (Esc cancels it).
+function M.delete_pending()
+  return pending ~= nil
+end
+
 local function set_pending(key, items)
   local paths = {}
   for _, item in ipairs(items) do
