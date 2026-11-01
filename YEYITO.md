@@ -95,6 +95,13 @@ change needs a rebuild. Measured Oct 2026, none of the Lua was worth moving:
 indent guides add 0.3 ms to a full redraw, and the freezes found were
 blocking calls, which C would not have avoided.
 
+A change and the layout it needs should reach the terminal in one frame:
+`TextChanged*` and `CursorMoved*` run before the screen is drawn, a
+`vim.schedule` callback after it. `:redrawstatus`, and `nvim__redraw` with
+`valid` or `range` unless `flush = false`, draw right away, ahead of any
+autocommands still to run. `frames()` in `test_smooth_scroll.py` counts a key's
+frames.
+
 To check that a change doesn't alter how things look, render the same file
 with two builds and diff the screens cell by cell (colors included):
 `test/yeyito/screendiff/shot.sh ~/.local/bin/nvim app.py before.txt`, then

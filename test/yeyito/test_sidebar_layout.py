@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_smooth_scroll import NVIM, ROWS, COLS, Term, check, failures  # noqa: E402
+from test_smooth_scroll import NVIM, ROWS, COLS, Term, check, failures, frames  # noqa: E402
 
 LAYOUT = r'''
 local ui = package.loaded["vim._core.ui2"]
@@ -153,6 +153,47 @@ def main():
         mode = expr("json_encode(mode())")
         check("AI box: Shift+Enter from st adds a line; Esc is normal mode",
               lines == ["one", "two"] and mode == "n", (lines, mode))
+        t.keys(b"\x1b")
+    finally:
+        t.close()
+
+    # The AI's request box changes layout in the same screen update as the text:
+    # one frame per key (no ruler: ui2 draws it in a frame of its own), and the
+    # text never scrolls out of view, not even when a row fills up exactly and
+    # the cursor is alone on the next one.
+    t, layout, expr = run(["-c", "set noruler"])
+    try:
+        t.keys(b" a")
+        width = expr("json_encode(winwidth(0))")
+
+        def press(key):
+            out = t.keys(key, idle=0.2)
+            view = expr("json_encode([winheight(0), winline(), winsaveview().skipcol])")
+            return out, frames(out), view
+        out, drawn, view = press(b"x")
+        check("AI box: the first letter replaces the placeholder in one frame",
+              len(drawn) == 1 and b"what to do" not in out and view == [1, 1, 0], (drawn, view))
+        t.keys(b"x" * (width - 3), idle=0.3)
+        for typed, want in ((width - 1, [1, 1, 0]), (width, [2, 2, 0]), (width + 1, [2, 2, 0])):
+            _, drawn, view = press(b"x")
+            check("AI box: char %d of a %d-wide row: one frame, no scrolling" % (typed, width),
+                  len(drawn) == 1 and view == want, (drawn, view))
+        for left, want in ((width, [2, 2, 0]), (width - 1, [1, 1, 0])):
+            _, drawn, view = press(b"\x7f")
+            check("AI box: Backspace to %d chars: one frame" % left, len(drawn) == 1 and view == want, (drawn, view))
+        _, drawn, view = press(b"\x1b[13;2u")
+        check("AI box: Shift+Enter grows it in one frame", len(drawn) == 1 and view == [2, 2, 0], (drawn, view))
+        t.keys(b"\x1b")
+        out = t.keys(b"dd", idle=0.2)
+        blank_row = [f for f in frames(out) if b"\x1b[69X" in f or b"\x1b[%dX" % (width - 1) in f]
+        check("AI box: dd shrinks it without a frame of a blank row",
+              expr("json_encode(winheight(0))") == 1 and blank_row == [], frames(out))
+        t.keys(b"\x1b")
+        t.keys(b"\x13")
+        t.keys(b"/")
+        t.keys(b"m", idle=0.5)  # the first search builds the index
+        drawn = frames(t.keys(b"a", idle=0.2))
+        check("sidebar search: the letter and the list it filters in one frame", len(drawn) == 1, drawn)
         t.keys(b"\x1b")
     finally:
         t.close()

@@ -1351,14 +1351,15 @@ function M.open_bar(mode, direction)
     end
   end
   show_placeholder()
-  api.nvim_buf_attach(b, false, {
-    on_lines = function()
-      vim.schedule(function()
-        if bar and bar.buf == b and api.nvim_buf_is_valid(b) then
-          show_placeholder()
-          live_search()
-        end
-      end)
+  -- Before the screen is drawn, so the typed letter and the list it filters
+  -- show together.
+  api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
+    buffer = b,
+    callback = function()
+      if bar and bar.buf == b then
+        show_placeholder()
+        live_search()
+      end
     end,
   })
   local function imap(lhs, rhs, opts)
@@ -1741,21 +1742,31 @@ local function prompt(opts)
       })
     end
   end
-  --- The field grows with the text (wrapped), up to max_height rows.
+  --- The field grows with the text (wrapped), up to max_height rows, counting
+  --- the row the cursor is on: right after a row fills up it is alone on the
+  --- next one, and a field one row short would scroll the text away.
   local function relayout()
-    if not (modal and modal.input == input and api.nvim_win_is_valid(input)) then
+    if not (opts.vim and modal and modal.input == input and api.nvim_win_is_valid(input)) then
       return
     end
-    local want = 1
-    if opts.vim then
-      want = math.max(1, math.min(max_height, api.nvim_win_text_height(input, {}).all))
+    local text_rows = api.nvim_win_text_height(input, {}).all
+    local lnum = api.nvim_win_get_cursor(input)[1]
+    local above = lnum > 1 and api.nvim_win_text_height(input, { end_row = lnum - 2 }).all or 0
+    local to_cursor = above + math.ceil(vim.fn.virtcol(".", false, input) / api.nvim_win_get_width(input))
+    local want = math.max(1, math.min(max_height, math.max(text_rows, to_cursor)))
+    if want == height then
+      return
     end
-    if want ~= height then
-      height = want
-      api.nvim_win_set_config(input, { height = height })
-      api.nvim_win_set_config(frame, { height = 2 + height })
-    end
+    height = want
+    api.nvim_win_set_config(input, { height = height })
+    api.nvim_win_set_config(frame, { height = 2 + height })
     draw_frame()
+    -- Neovim already scrolled to show the cursor in the old size.
+    if math.max(text_rows, to_cursor) <= max_height then
+      api.nvim_win_call(input, function()
+        vim.fn.winrestview({ topline = 1, skipcol = 0 })
+      end)
+    end
   end
   draw_frame()
 
@@ -1773,17 +1784,19 @@ local function prompt(opts)
     end
   end
   show_placeholder()
-  api.nvim_buf_attach(b, false, {
-    on_lines = function()
-      vim.schedule(function()
-        if api.nvim_buf_is_valid(b) then
-          show_placeholder()
-          relayout()
-        end
-      end)
+  -- These run before the screen is drawn, so a change and the layout it needs
+  -- reach the terminal together (from a scheduled callback the screen would
+  -- show the old layout for a frame).
+  api.nvim_create_autocmd({ "TextChangedI", "TextChangedP", "TextChanged" }, {
+    buffer = b,
+    callback = show_placeholder,
+  })
+  api.nvim_create_autocmd({ "TextChangedI", "TextChangedP", "TextChanged", "CursorMovedI", "CursorMoved" }, {
+    buffer = b,
+    callback = function()
+      relayout()
     end,
   })
-  relayout() -- for the text it starts from
 
   local function submit()
     local t = text()
@@ -1864,6 +1877,7 @@ local function prompt(opts)
   -- Typing goes after the text it starts from.
   local last = api.nvim_buf_line_count(b)
   api.nvim_win_set_cursor(input, { last, #(api.nvim_buf_get_lines(b, last - 1, last, false)[1] or "") })
+  relayout() -- for the text it starts from
   vim.cmd.startinsert({ bang = true })
 end
 

@@ -228,7 +228,11 @@ function M.setup()
   api.nvim_create_autocmd({ "ModeChanged", "DiagnosticChanged" }, {
     group = group,
     callback = function()
-      vim.cmd.redrawstatus()
+      -- Not from a float (it has no status line): :redrawstatus draws the whole
+      -- screen now, ahead of the float's own autocommands (a text box resizing).
+      if api.nvim_win_get_config(0).relative == "" then
+        vim.cmd.redrawstatus()
+      end
     end,
   })
 end

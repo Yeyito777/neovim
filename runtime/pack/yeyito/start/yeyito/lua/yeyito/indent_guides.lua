@@ -171,10 +171,15 @@ function M.setup()
   api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP", "InsertLeave" }, {
     group = group,
     callback = function(args)
+      if exclude_ft[vim.bo[args.buf].filetype] or exclude_bt[vim.bo[args.buf].buftype] then
+        return
+      end
       local line = api.nvim_get_current_line()
       local key = ("%d:%s:%s"):format(api.nvim_buf_line_count(args.buf), line:match("^%s*"), line:find("%S") and 1 or 0)
       if args.event == "TextChanged" or args.event == "InsertLeave" or last[args.buf] ~= key then
-        api.nvim__redraw({ buf = args.buf, valid = false })
+        -- Only mark it: the screen is drawn right after these events. (Without
+        -- flush = false this draws now, a frame ahead of later autocommands.)
+        api.nvim__redraw({ buf = args.buf, valid = false, flush = false })
       end
       last[args.buf] = key
     end,
