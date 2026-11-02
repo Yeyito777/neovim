@@ -687,6 +687,76 @@ static bool curgrid_covered_rect(int top, int bot, int left, int right)
   return false;
 }
 
+/// Scroll rows [top, bot), columns [left, right) of curgrid with grids over them: the terminal
+/// scrolls all of it, grids included, and what the scroll moved of them is put back in the same
+/// frame. The TUI is told what stays put (the same as the Exocortex TUI beside its Tasks panel),
+/// so a window under a float can glide around it.
+///
+/// @return  false if the area can't be scrolled that way: it has to be redrawn in place.
+static bool scroll_under_grids(int top, int bot, int left, int right, int rows)
+{
+  enum { kMaxOver = 4, };  // GLIDE_MAXOVER in tui.c
+  struct { int top, bot, left, right; } over[kMaxOver];
+  int nover = 0;
+  for (size_t i = curgrid->comp_index + 1; i < kv_size(layers); i++) {
+    ScreenGrid *g = kv_A(layers, i);
+    int g_top = g->comp_row;
+    int g_bot = g->comp_row + MIN(g->rows, g->comp_height);
+    int g_left = g->comp_col;
+    int g_right = g->comp_col + MIN(g->cols, g->comp_width);
+    if (g == &msg_grid) {
+      g_top = msg_current_row - (msg_was_scrolled ? 1 : 0);
+      g_bot = Rows;
+    }
+    if (g->comp_disabled || g_top >= bot || g_bot <= top || g_left >= right || g_right <= left) {
+      continue;
+    }
+    // Messages come and go by the row, and a see-through grid shows the lines under it.
+    if (g == &msg_grid || g->blending || nover == kMaxOver) {
+      return false;
+    }
+    over[nover].top = MAX(g_top, top);
+    over[nover].bot = MIN(g_bot, bot);
+    over[nover].left = MAX(g_left, left);
+    over[nover].right = MIN(g_right, right);
+    nover++;
+  }
+
+  char mark[32 + kMaxOver * 32];
+  size_t len = (size_t)snprintf(mark, sizeof(mark), "\x1b_nvim-glide-over");
+  for (int i = 0; i < nover; i++) {
+    len += (size_t)snprintf(mark + len, sizeof(mark) - len, ";%d,%d,%d,%d",
+                            over[i].top, over[i].bot, over[i].left, over[i].right);
+  }
+  len += (size_t)snprintf(mark + len, sizeof(mark) - len, "\x1b\\");
+  ui_call_ui_send((String){ .data = mark, .size = len });
+  ui_composed_call_grid_scroll(1, top, bot, left, right, rows, 0);
+
+  for (int i = 0; i < nover; i++) {
+    int g_left = over[i].left;
+    int g_right = over[i].right;
+    compose_debug(over[i].top, over[i].bot, g_left, g_right, dbghl_recompose, true);
+    // The scroll took the grid's cells `rows` up or down: into the rows above or below it, where
+    // what was under it shows now.
+    int first = MAX(over[i].top - MAX(rows, 0), top);
+    int last = MIN(over[i].bot + MAX(-rows, 0), bot);
+    for (int r = first; r < last; r++) {
+      // Not valid: scrolled in, for win_update() to draw (also a second scroll in a row, see
+      // below). Only the grid's own cells can be drawn there.
+      bool valid = r >= top + MAX(-rows, 0) && r < bot - MAX(rows, 0)
+                   && curgrid->attrs[curgrid->line_offset[r - curgrid->comp_row]
+                                     + (size_t)g_left - (size_t)curgrid->comp_col] >= 0;
+      if (valid) {
+        // Invalid flag: a doublewidth char the grid's edge cuts in two may have moved here too.
+        compose_line(r, g_left, g_right, kLineFlagInvalid);
+      } else if (r >= over[i].top && r < over[i].bot) {
+        compose_line(r, g_left, g_right, 0);
+      }
+    }
+  }
+  return true;
+}
+
 void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, Integer right,
                          Integer rows, Integer cols)
 {
@@ -697,13 +767,14 @@ void ui_comp_grid_scroll(Integer grid, Integer top, Integer bot, Integer left, I
   bot += curgrid->comp_row;
   left += curgrid->comp_col;
   right += curgrid->comp_col;
-  // Only a grid over the scrolled area itself prevents scrolling it: a float
-  // elsewhere on screen (a cmdline window, a sidebar's foot) does not.
+  // A float elsewhere on screen (a cmdline window, a sidebar's foot) changes nothing here.
   bool covered = curgrid_covered_rect((int)top, (int)bot, (int)left, (int)right);
+  if (covered && !curgrid->blending
+      && scroll_under_grids((int)top, (int)bot, (int)left, (int)right, (int)rows)) {
+    return;
+  }
 
   if (covered || curgrid->blending) {
-    // TODO(bfredl):
-    // 2. calculate subareas that can scroll.
     compose_debug(top, bot, left, right, dbghl_recompose, true);
     for (int r = (int)(top + MAX(-rows, 0)); r < bot - MAX(rows, 0); r++) {
       // TODO(bfredl): workaround for win_update() performing two scrolls in a

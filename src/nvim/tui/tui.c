@@ -65,9 +65,15 @@
 /// the window text area in screen cells (BOT and RIGHT exclusive, like
 /// grid_scroll). It is consumed here, never written to the terminal.
 #define GLIDE_MARK "\x1b_nvim-glide;"
+/// The compositor sends this just before a region scroll with floats over it:
+/// "\x1b_nvim-glide-over;TOP,BOT,LEFT,RIGHT;...\x1b\\", the cells of each float
+/// over the region (BOT and RIGHT exclusive). They stay put; the rest moves.
+#define GLIDE_OVER_MARK "\x1b_nvim-glide-over;"
 #define GLIDE_MS 100      ///< glide duration, st's own smoothscroll_ms feel
 #define GLIDE_MAXARMS 4
 #define GLIDE_MAXTERMS 16
+#define GLIDE_MAXOVER 4   ///< kMaxOver in ui_compositor.c
+#define GLIDE_MAXRECTS 8  ///< moving rectangles st takes
 #define LINUXSET0C "\x1b[?0c"
 #define LINUXSET1C "\x1b[?1c"
 
@@ -132,7 +138,11 @@ struct TUIData {
     int narmed;
     Rect armed[GLIDE_MAXARMS];  ///< windows whose view moved in this frame
     bool consumed[GLIDE_MAXARMS];  ///< a region scroll drew that move
-    Rect rect;  ///< moving rectangle declared to the terminal (top < 0: none)
+    Rect rect;  ///< region the terminal keeps lines for (top < 0: none)
+    Rect over[GLIDE_MAXOVER];  ///< floats that stay put over the next region scroll
+    int nover;
+    Rect moving[GLIDE_MAXRECTS];  ///< moving rectangles declared to the terminal
+    int nmoving;
     /// Easing terms the terminal is running: rows still to go at `start`.
     struct {
       uint64_t start;
@@ -1512,6 +1522,8 @@ static void glide_reset(TUIData *tui)
 {
   tui->glide.narmed = 0;
   tui->glide.rect = (Rect){ -1, -1, -1, -1 };
+  tui->glide.nover = 0;
+  tui->glide.nmoving = 0;
   tui->glide.nterms = 0;
 }
 
@@ -1553,6 +1565,25 @@ static void glide_snap(TUIData *tui)
 /// `content` is not one, so it is written to the terminal as usual.
 static bool glide_arm(TUIData *tui, String content)
 {
+  size_t overlen = sizeof(GLIDE_OVER_MARK) - 1;
+  if (content.size > overlen && memcmp(content.data, GLIDE_OVER_MARK, overlen) == 0) {
+    char over[256];
+    size_t len = MIN(content.size - overlen, sizeof(over) - 1);
+    memcpy(over, content.data + overlen, len);
+    over[len] = NUL;
+    tui->glide.nover = 0;
+    for (char *p = over; p != NULL && tui->glide.nover < GLIDE_MAXOVER;) {
+      Rect r;
+      if (sscanf(p, "%d,%d,%d,%d", &r.top, &r.bot, &r.left, &r.right) != 4) {
+        break;
+      }
+      tui->glide.over[tui->glide.nover++] = r;
+      p = strchr(p, ';');
+      p = p ? p + 1 : NULL;
+    }
+    return true;
+  }
+
   size_t marklen = sizeof(GLIDE_MARK) - 1;
   if (content.size <= marklen || memcmp(content.data, GLIDE_MARK, marklen) != 0) {
     return false;
@@ -1582,6 +1613,55 @@ static int glide_match(TUIData *tui, int top, int bot, int left, int right)
   return -1;
 }
 
+/// What moves of `region` (inclusive): all of it but the floats over it, the way
+/// the Exocortex TUI goes around its Tasks panel: the columns beside a float for
+/// the region's full height (their edges are the region's, so the terminal fills
+/// what a glide uncovers with the lines its scroll pushed out), and the float's
+/// own columns above and below it.
+///
+/// @return  how many rectangles, -1 for more than the terminal takes.
+static int glide_moving_rects(TUIData *tui, Rect region, Rect *rects)
+{
+  int n = 1;
+  rects[0] = region;
+  for (int o = 0; o < tui->glide.nover; o++) {
+    Rect f = tui->glide.over[o];  // BOT and RIGHT are exclusive here
+    Rect next[GLIDE_MAXRECTS];
+    int nnext = 0;
+    for (int i = 0; i < n; i++) {
+      Rect r = rects[i];
+      Rect parts[4];
+      int nparts = 0;
+      if (f.top > r.bot || f.bot <= r.top || f.left > r.right || f.right <= r.left) {
+        parts[nparts++] = r;
+      } else {
+        int f_left = MAX(f.left, r.left);
+        int f_right = MIN(f.right - 1, r.right);
+        if (r.left < f_left) {
+          parts[nparts++] = (Rect){ r.top, r.bot, r.left, f_left - 1 };
+        }
+        if (r.right > f_right) {
+          parts[nparts++] = (Rect){ r.top, r.bot, f_right + 1, r.right };
+        }
+        if (r.top < f.top) {
+          parts[nparts++] = (Rect){ r.top, f.top - 1, f_left, f_right };
+        }
+        if (r.bot >= f.bot) {
+          parts[nparts++] = (Rect){ f.bot, r.bot, f_left, f_right };
+        }
+      }
+      if (nnext + nparts > GLIDE_MAXRECTS) {
+        return -1;
+      }
+      memcpy(next + nnext, parts, (size_t)nparts * sizeof(Rect));
+      nnext += nparts;
+    }
+    memcpy(rects, next, (size_t)nnext * sizeof(Rect));
+    n = nnext;
+  }
+  return n;
+}
+
 /// After a region scroll (rows > 0: content moved up) of a marked window:
 /// draw its content where it was and let the terminal ease it into place.
 /// Rows and columns are inclusive here.
@@ -1593,8 +1673,26 @@ static void glide_start(TUIData *tui, int top, int bot, int left, int right, int
     // Another window: the terminal kept lines for this region only.
     glide_snap(tui);
     remaining = 0;
-    out_printf(tui, 64, "\x1b]2032;r;%d,%d,%d,%d\x1b\\", top + 1, left + 1, bot + 1, right + 1);
     tui->glide.rect = rect;
+    tui->glide.nmoving = 0;
+  }
+  Rect moving[GLIDE_MAXRECTS];
+  int nmoving = glide_moving_rects(tui, rect, moving);
+  if (nmoving <= 0) {
+    // Floats over all of it, or too many to go around.
+    glide_snap(tui);
+    return;
+  }
+  if (nmoving != tui->glide.nmoving
+      || memcmp(moving, tui->glide.moving, (size_t)nmoving * sizeof(Rect)) != 0) {
+    out(tui, S_LEN("\x1b]2032;r"));
+    for (int i = 0; i < nmoving; i++) {
+      out_printf(tui, 64, ";%d,%d,%d,%d", moving[i].top + 1, moving[i].left + 1,
+                 moving[i].bot + 1, moving[i].right + 1);
+    }
+    out(tui, S_LEN("\x1b\\"));
+    memcpy(tui->glide.moving, moving, (size_t)nmoving * sizeof(Rect));
+    tui->glide.nmoving = nmoving;
   }
   int height = bot - top + 1;
   double offset = remaining + rows;
@@ -1621,6 +1719,7 @@ static void glide_end_frame(TUIData *tui)
   if (!tui->glide.on) {
     return;
   }
+  tui->glide.nover = 0;
   for (int i = 0; i < tui->glide.narmed; i++) {
     if (!tui->glide.consumed[i]) {
       glide_snap(tui);
@@ -1718,6 +1817,7 @@ void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, 
     }
     invalidate(tui, (int)startrow, (int)endrow, (int)startcol, (int)endcol);
   }
+  tui->glide.nover = 0;
 }
 
 /// Add a URL to be used in an OSC 8 hyperlink.

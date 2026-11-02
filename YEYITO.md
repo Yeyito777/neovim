@@ -16,11 +16,13 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
   scroll glides into place instead of jumping. Also `drawscreen.c`: a page
   back (CTRL-B) region-scrolls like a page forward does, so it glides too.
   See [Smooth scrolling](#smooth-scrolling).
-- **Floats only block scrolls they overlap** (C, `ui_compositor.c`): a
-  region scroll used to be dropped for a full repaint whenever any float was
-  on screen; now only when one overlaps the scrolled area (upstream's TODO).
-  Always-present floats (ui2's command line, the sidebar's foot) would
-  otherwise disable smooth scrolling and make every scroll a repaint.
+- **Floats don't block scrolling** (C, `ui_compositor.c`): a region scroll
+  used to be dropped for a full repaint whenever any float was on screen. A
+  float elsewhere now changes nothing, and with one over the scrolled area the
+  terminal scrolls it all and the float's cells are drawn back in the same
+  frame (upstream's TODO, "calculate subareas that can scroll"). That is what
+  lets a window glide with ui2's command line, the sidebar's foot or the AI's
+  card on screen. See [Smooth scrolling](#smooth-scrolling).
 - **ui2 left offset** (Lua, `runtime/lua/vim/_core/ui2.lua`, `ui2/messages.lua`):
   `require('vim._core.ui2').set_col(n)` keeps the command line, messages,
   pager and dialogs right of the first `n` columns, so the file sidebar can run
@@ -144,8 +146,20 @@ scroll pushed out. A window that moved without a region scroll (it was
 redrawn) stops any glide (`OSC 2032 ; o ; 0`). Other terminals, tmux and
 `nvim --clean` are unaffected.
 
+A float over the window (the AI's reply card, say) stays put and the text
+glides around it, as Exocortex's history does around its Tasks panel: the
+compositor tells the TUI what is over the scroll (`\x1b_nvim-glide-over;...`, never
+written to the terminal), and the moving rectangles are the columns beside it
+for the window's full height plus its own columns above and below it. On a big
+jump (CTRL-D) the columns under it show an empty strip for the first 50 ms,
+since the terminal never had the text behind it. See-through floats
+(`winblend`) or more than four over a window are still drawn in place, with no
+glide.
+
 Tests: `python3 test/yeyito/test_smooth_scroll.py` runs the real TUI against a
-fake st on a PTY and checks each frame's bytes. In a real st,
+fake st on a PTY and checks each frame's bytes; with floats up, a small terminal
+model (`Screen`) is also compared with Neovim's screen, cell by cell, after
+every key. In a real st,
 `ST_SMOOTHSCROLL_LOG=file` logs the offset of every frame drawn.
 
 ## File sidebar (Ctrl+S)
