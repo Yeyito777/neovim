@@ -28,6 +28,10 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
   pager and dialogs right of the first `n` columns, so the file sidebar can run
   the full height. `vim._core.ui2` is compiled into the binary: rebuild after
   editing it.
+- **`v:fcs_choice` "keep"** (C, `fileio.c`): the buffer already has what's in
+  the changed file, so a later `:write` has nothing to warn about. Lua can't
+  reach that timestamp, and the AI needs it to show another Neovim's edits as
+  edits (see [AI](#ai-leadera-ai)) instead of reloading the buffer.
 - **Visual range label** (Lua, `runtime/lua/vim/_core/ui2/cmdline.lua`): `:` in
   visual mode shows `[+ 12 lines]` instead of `'<,'>` and keeps the selection
   highlighted (see [Command line and messages](#command-line-and-messages)).
@@ -302,10 +306,23 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
 - Its reply shows in the card (`code` as in Exocortex). Esc in normal mode
   puts it away; the Esc that leaves insert or visual mode, closes a box or
   menu, or cancels a sidebar `d` leaves it up.
-  **`:Ai log`** shows this session's requests, what it did and the replies.
+  **`:Ai log`** shows the conversation so far: everyone's requests, what it
+  did and the replies, from the daemon.
 - One conversation per project (the working directory), hidden from the
-  Exocortex sidebar, kept until it has been idle an hour (a Neovim started
-  meanwhile picks it up). **`:Ai new`** starts a fresh one.
+  Exocortex sidebar, kept until it has been idle an hour. **`:Ai new`** starts
+  a fresh one.
+- **All the Neovims in a folder share that conversation** through the daemon,
+  as Exocortex's TUIs do: a Neovim joins it when it starts (`g:yeyito_ai_sync`,
+  on; off, only once it's asked something) and when `:cd` takes it to the folder.
+  Each runs the requests asked in it, on its own unsaved changes; the others
+  show the same card, reply and green lines, and buffers follow the edits, moves
+  and deletes (one `u` undoes a request there too; a buffer with unsaved changes
+  is left alone, and Vim warns about the file as usual). Asking while another
+  Neovim's request runs queues it: the queue and its count are per Neovim, and
+  the requests take turns. Ctrl+Q stops the running request wherever it was
+  asked; `:Ai new` ends the conversation everywhere and drops what's running
+  and queued. Quitting a Neovim stops the request it was running, since its
+  tools can't run without it.
 - An Exocortex daemon restart while it works is a pause, not an error: the
   client reconnects and the request carries on when the daemon is back.
 
@@ -317,7 +334,9 @@ Lua client, vendored as `lua/exocortex/` (Exocortex's `docs/app-api.md`).
 
 Tests: `VIMRUNTIME=$PWD/runtime build/bin/nvim --headless -u NORC -c
 'luafile test/yeyito/test_ai.lua'` (the tools, then the whole path against
-Exocortex's fake daemon: needs bun and an Exocortex checkout).
+Exocortex's fake daemon: needs bun and an Exocortex checkout);
+`python3 test/yeyito/test_ai_shared.py` (real Neovims sharing a conversation on
+the fake daemon).
 
 ## Command line and messages
 

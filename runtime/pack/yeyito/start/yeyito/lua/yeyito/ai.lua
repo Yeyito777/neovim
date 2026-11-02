@@ -7,7 +7,7 @@
 --                    about the selected text)
 --   :Ai [request]    the same from the command line (:ai too; with a range,
 --                    about those lines); :Ai new  a fresh conversation;
---                    :Ai log  this session's requests and replies;
+--                    :Ai log  the conversation so far;
 --                    :Ai clear  no more green on the lines it changed
 --   Ctrl+Q           stop it while it works (the next queued request then runs)
 --   Esc              in normal mode: put its reply away, then the green block
@@ -15,6 +15,9 @@
 -- One conversation per project (the working directory), hidden from the
 -- Exocortex sidebar, kept until it has been idle an hour. Asking while it works
 -- queues the request for when the running one ends, as in Exocortex.
+-- All the Neovims in a folder share that conversation through the daemon, as
+-- Exocortex's TUIs do: each runs the requests asked in it, and all of them show
+-- the work, the reply and the changes. Ctrl+Q and :Ai new reach all of them.
 local M = {}
 
 local api, uv = vim.api, vim.uv
@@ -23,7 +26,7 @@ local files = require("yeyito.files")
 
 local APP = "nvim"
 local IDLE_TTL = 60 * 60 * 1000
-local STATE = vim.fn.stdpath("state") .. "/ai.json" -- project -> conversation id
+local FOLLOW_CHECK = 2000 -- how often to ask the daemon if another Neovim's request still runs
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 local READ_LIMIT = 2000 -- lines read_file returns at once
 
@@ -36,8 +39,8 @@ local client ---@type table? the connection to the daemon
 local connecting ---@type function[]? callbacks waiting for it
 local convs = {} ---@type table<string, table> project -> conversation
 local busy = {} ---@type table<string, table> project -> the running turn
+local foreign = {} ---@type table<string, table> project -> another Neovim's running turn
 local queue = {} ---@type table<string, table[]> project -> requests waiting for it to end
-local log = {} ---@type table<string, table[]> project -> { request, did, reply }
 local applying = false -- our own buffer changes: they keep the green tint
 local draft ---@type string? a request closed without sending, for the next box
 
@@ -410,26 +413,7 @@ end
 
 -- ── Conversation ──────────────────────────────────────────────────────────
 
-local function read_state()
-  local f = io.open(STATE, "r")
-  if not f then
-    return {}
-  end
-  local ok, data = pcall(vim.json.decode, f:read("*a"))
-  f:close()
-  return ok and type(data) == "table" and data or {}
-end
-
-local function write_state(root, id)
-  local data = read_state()
-  data[root] = id
-  vim.fn.mkdir(vim.fs.dirname(STATE), "p")
-  local f = io.open(STATE, "w")
-  if f then
-    f:write(vim.json.encode(data))
-    f:close()
-  end
-end
+local on_daemon_event
 
 local function with_client(cb)
   if client and not client.closed then
@@ -444,55 +428,87 @@ local function with_client(cb)
     local waiting = connecting
     connecting = nil
     client = c
+    if c then
+      c:on_event(on_daemon_event)
+    end
     for _, fn in ipairs(waiting) do
       fn(err, c)
     end
   end)
 end
 
---- The project's conversation: the one this Neovim has, else the last one it
---- had there (another Neovim, before a restart) while the daemon keeps it,
---- else a new one. Its tools are rebuilt for each request (`turn`).
-local function conversation(root, turn, cb)
+local following
+
+--- Share conversation `id` with the other Neovims in `root`.
+local function join(c, root, id, cb)
+  c:join(id, function(e, conv)
+    if e then
+      return cb(e)
+    end
+    convs[root] = conv
+    if conv.info.streaming and not busy[root] then
+      following(root)
+    end
+    cb(nil, conv)
+  end)
+end
+
+--- The project's conversation, if it has one: the one this Neovim is in, else
+--- the one the daemon has for the folder.
+local function find(root, cb)
   with_client(function(err, c)
     if err then
       return cb(err)
     end
-    local defs = tools(root, turn)
     local conv = convs[root]
     if conv and not conv.ended then
-      conv:_set_tools(defs) -- the definitions are the same: only the handlers change
       return cb(nil, conv)
     end
-    local function create()
-      c:conversation({
-        lifetime = "temporary",
-        idle_ttl_ms = IDLE_TTL,
-        title = "Neovim · " .. vim.fs.basename(root),
-        system = { base = "none", text = system_prompt(root) },
-        model = vim.g.yeyito_ai_model,
-        cwd = root,
-        builtin = { "bash", "glob", "grep" },
-        tools = defs,
-      }, function(e, new)
-        if e then
-          return cb(e)
-        end
-        convs[root] = new
-        write_state(root, new.id)
-        cb(nil, new)
-      end)
-    end
-    local saved = read_state()[root]
-    if not saved then
-      return create()
-    end
-    c:attach(saved, { tools = defs }, function(e, old)
+    c:list({}, function(e, list)
       if e then
-        return create() -- expired, or the daemon was reinstalled
+        return cb(e)
       end
-      convs[root] = old
-      cb(nil, old)
+      for _, info in ipairs(list) do -- the last active first
+        if info.cwd == root then
+          return join(c, root, info.convId, function(je, joined)
+            if je then
+              return cb() -- gone meanwhile
+            end
+            cb(nil, joined)
+          end)
+        end
+      end
+      cb()
+    end)
+  end)
+end
+
+--- The project's conversation, a new one if it has none. Its tools' handlers
+--- are rebuilt for each request (`turn`).
+local function conversation(root, turn, cb)
+  local defs = tools(root, turn)
+  find(root, function(err, conv)
+    if err then
+      return cb(err)
+    end
+    if conv then
+      conv:set_handlers(defs)
+      return cb(nil, conv)
+    end
+    client:conversation({
+      lifetime = "temporary",
+      idle_ttl_ms = IDLE_TTL,
+      title = "Neovim · " .. vim.fs.basename(root),
+      system = { base = "none", text = system_prompt(root) },
+      model = vim.g.yeyito_ai_model,
+      cwd = root,
+      builtin = { "bash", "glob", "grep" },
+      tools = defs,
+    }, function(e, new)
+      if e then
+        return cb(e)
+      end
+      join(client, root, new.id, cb)
     end)
   end)
 end
@@ -797,6 +813,8 @@ local function editor_state(root, turn)
   return #out > 0 and "\n\n<editor>\n" .. table.concat(out, "\n") .. "\n</editor>" or ""
 end
 
+local pump
+
 --- Run `turn`; when it ends, however it ends, the next queued request runs (as in
 --- Exocortex). `follows`: right after another one, whose reply stays on the card.
 local function start(root, turn, follows)
@@ -814,17 +832,12 @@ local function start(root, turn, follows)
     busy[root] = nil
     release(turn)
     if not turn.dropped then
-      log[root] = log[root] or {}
-      table.insert(log[root], { request = turn.request, did = turn.did, reply = text, kind = kind })
       show_result(kind, text)
       if M.on_done then
         M.on_done(kind, text)
       end
     end
-    local waiting = queue[root]
-    if waiting and waiting[1] then
-      start(root, table.remove(waiting, 1), not turn.dropped)
-    end
+    pump(root, not turn.dropped)
   end
   local retried = false
   local function send()
@@ -847,11 +860,18 @@ local function start(root, turn, follows)
           return finish()
         end
         if e then
+          -- Another Neovim's request got there first: this one runs after it.
+          if tostring(e.message):find("Already streaming", 1, true) then
+            busy[root] = nil
+            queue[root] = queue[root] or {}
+            table.insert(queue[root], 1, turn)
+            following(root)
+            return draw_card()
+          end
           -- The daemon dropped it (idle too long, a reinstall): once more, in a new one.
           if not retried and (e.code == "ended" or tostring(e.message):lower():find("conversation")) then
             retried = true
             convs[root] = nil
-            write_state(root, nil)
             return send()
           end
           return finish("error", e.message or tostring(e))
@@ -869,6 +889,209 @@ local function start(root, turn, follows)
   send()
 end
 
+--- The next waiting request runs, if the conversation is free.
+pump = function(root, follows)
+  local waiting = queue[root]
+  if waiting and waiting[1] and not busy[root] and not foreign[root] then
+    start(root, table.remove(waiting, 1), follows)
+  end
+end
+
+-- ── The other Neovims in the folder ───────────────────────────────────────
+
+--- Another Neovim's request changed `path`: this buffer shows it the way the
+--- asker's does (tinted, one u). Its unsaved changes keep it out of this, and
+--- Vim warns about the file as usual.
+local function sync_file(path, turn)
+  local b = vim.fn.bufnr(path)
+  if b <= 0 or not api.nvim_buf_is_loaded(b) or vim.bo[b].modified then
+    return
+  end
+  local f = io.open(path, "rb")
+  if not f then
+    return
+  end
+  local data = f:read("*a")
+  f:close()
+  -- Otherwise (a CRLF file, another encoding) it's left to 'autoread'.
+  if vim.bo[b].fileformat == "unix" and (vim.bo[b].fileencoding == "" or vim.bo[b].fileencoding == "utf-8") then
+    apply(b, split(data), turn)
+    vim.bo[b].modified = false
+    -- This buffer has the file now: 'autoread' must not read it over the tint,
+    -- nor :write warn about it. Without 'autoread' a change on disk runs this
+    -- autocmd instead of reloading; "keep" is a patch of this fork.
+    local absorb = api.nvim_create_autocmd("FileChangedShell", {
+      buffer = b,
+      callback = function()
+        vim.v.fcs_choice = "keep"
+      end,
+    })
+    vim.bo[b].autoread = false
+    pcall(vim.cmd, "silent! checktime " .. b)
+    api.nvim_buf_call(b, function()
+      vim.cmd("setlocal autoread<")
+    end)
+    api.nvim_del_autocmd(absorb)
+  end
+end
+
+--- What another Neovim's tool call did, done here too.
+local function follow_tool(root, call, turn)
+  local name, input = call.name, call.input
+  local sidebar = require("yeyito.sidebar")
+  if name == "edit_file" or name == "write_file" then
+    local path = resolve(root, input.path)
+    sync_file(path, turn)
+    sidebar.changed(path)
+  elseif name == "move_path" then
+    local from, to = resolve(root, input.from), resolve(root, input.to)
+    files.moved_elsewhere(from, to)
+    sidebar.moved(from, to)
+    sidebar.changed(to)
+  elseif name == "delete_path" then
+    files.deleted_elsewhere(resolve(root, input.path))
+    sidebar.changed()
+  end
+end
+
+--- Another Neovim's request ended (`kind`, `text`: how, unless that's unknown):
+--- what it did by other means shows, and this Neovim's next request can run.
+local function foreign_ended(root, kind, text)
+  foreign[root] = nil
+  pcall(vim.cmd, "silent! checktime")
+  require("yeyito.sidebar").changed()
+  if root == project() then
+    if kind then
+      show_result(kind, text)
+    elseif not busy[root] then
+      close_card()
+    end
+  end
+  pump(root, true)
+end
+
+--- Another Neovim's request runs in `root`. Returns what's kept of it.
+following = function(root)
+  if foreign[root] then
+    return foreign[root]
+  end
+  local turn = { touched = {}, calls = {} }
+  foreign[root] = turn
+  if root == project() then
+    card.root, card.lines = root, {}
+    show_working("thinking")
+  end
+  -- Its end can pass unseen (the connection dropped): the daemon knows.
+  local function check()
+    if foreign[root] ~= turn then
+      return
+    end
+    if not client or client.closed then
+      return foreign_ended(root)
+    end
+    client:list({}, function(e, list)
+      if foreign[root] ~= turn then
+        return
+      end
+      local running = e ~= nil
+      for _, info in ipairs(list or {}) do
+        if convs[root] and info.convId == convs[root].id then
+          running = info.streaming
+        end
+      end
+      if running then
+        vim.defer_fn(check, FOLLOW_CHECK)
+      else
+        foreign_ended(root)
+      end
+    end)
+  end
+  vim.defer_fn(check, FOLLOW_CHECK)
+  return turn
+end
+
+--- What's running and waiting in `root` goes, and the card.
+local function drop(root)
+  for _, t in ipairs(queue[root] or {}) do
+    release(t)
+  end
+  queue[root] = nil
+  if busy[root] then
+    busy[root].dropped = true
+  end
+  foreign[root] = nil
+  close_card()
+end
+
+local function daemon_event(ev)
+  local t = ev.type
+  if t == "app_conversation_created" then
+    -- Two Neovims that started one at the same moment settle on the same one.
+    local info, root = ev.conversation, project()
+    if info and info.cwd == root and client and not (convs[root] and convs[root].id <= info.convId) then
+      join(client, root, info.convId, function() end)
+    end
+    return
+  end
+  local root
+  for r, conv in pairs(convs) do
+    if conv.id == ev.convId then
+      root = r
+    end
+  end
+  if not root then
+    return
+  end
+  if t == "conversation_deleted" then
+    convs[root] = nil
+    if ev.reason == "deleted" then -- another Neovim's :Ai new
+      drop(root)
+    elseif foreign[root] then
+      foreign_ended(root)
+    end
+  elseif busy[root] then
+    return -- this Neovim's own: start() has it
+  elseif t == "streaming_started" or t == "user_message" or t == "turn_catchup" then
+    following(root)
+  elseif t == "tool_call" then
+    following(root).calls[ev.toolCallId] = {
+      name = tostring(ev.toolName):gsub("^mcp__app__", ""),
+      input = type(ev.input) == "table" and ev.input or {},
+    }
+    if root == project() then
+      show_working(activity(root, ev.toolName, ev.input))
+    end
+  elseif t == "tool_result" then
+    local turn = foreign[root]
+    local call = turn and turn.calls[ev.toolCallId]
+    if call and not ev.isError then
+      follow_tool(root, call, turn)
+    end
+  elseif t == "turn_result" and foreign[root] then
+    if ev.stopReason == "aborted" then
+      foreign_ended(root, "error", "Stopped.")
+    elseif ev.stopReason == "error" then
+      foreign_ended(root, "error", ev.error or "The model failed.")
+    else
+      foreign_ended(root, "done", ev.text ~= "" and ev.text or "Done.")
+    end
+  end
+end
+
+on_daemon_event = function(ev)
+  -- The client reads on after this: a failure here must not lose it the event.
+  local ok, err = pcall(daemon_event, ev)
+  if not ok then
+    vim.notify("AI: " .. tostring(err), vim.log.levels.ERROR)
+  end
+end
+
+--- Join the current project's conversation, if it has one, so that this Neovim
+--- shows what the others do there. Silent: no daemon, no AI until asked.
+function M.sync()
+  find(project(), function() end)
+end
+
 --- Ask the model to do `request` in the current project, now or, while it works
 --- there, when what it's doing ends. `sel`: the selected lines, { buf, first, last }.
 function M.ask(request, sel)
@@ -878,22 +1101,25 @@ function M.ask(request, sel)
   end
   local root = project()
   local turn = new_turn(request, sel)
-  if busy[root] then
+  if busy[root] or foreign[root] then
     queue[root] = queue[root] or {}
     table.insert(queue[root], turn)
+    card.root = root
     draw_card()
     return
   end
   start(root, turn, false)
 end
 
---- Ctrl+Q: stop the request running in this project. True if there was one.
+--- Ctrl+Q: stop the request running in this project, whichever Neovim asked it.
+--- True if there was one.
 function M.stop()
-  local turn = busy[project()]
-  if not (turn and turn.conv) then
+  local root = project()
+  local conv = busy[root] and busy[root].conv or foreign[root] and convs[root]
+  if not conv then
     return false
   end
-  turn.conv:abort()
+  conv:abort()
   return true
 end
 
@@ -930,60 +1156,94 @@ local function selection(first, last)
   return { buf = buf, first = math.min(first, last), last = math.max(first, last) }
 end
 
---- :Ai log: this session's requests in the project, what was done, the replies.
-function M.show_log()
-  local root = project()
+--- The log's text: `entries` (the daemon's history), then what waits here.
+local function log_lines(root, entries)
   local lines = { "# AI · " .. vim.fs.basename(root), "" }
-  for _, t in ipairs(log[root] or {}) do
-    vim.list_extend(lines, { "## You", "" })
-    vim.list_extend(lines, vim.split(t.request, "\n", { plain = true }))
+  local function add(text)
+    vim.list_extend(lines, vim.split(text, "\n", { plain = true }))
     lines[#lines + 1] = ""
-    if #t.did > 0 then
-      for _, d in ipairs(t.did) do
-        lines[#lines + 1] = "- " .. d
-      end
-      lines[#lines + 1] = ""
+  end
+  local last_request
+  for i, entry in ipairs(entries) do
+    if entry.type == "user" then
+      last_request = i
     end
-    vim.list_extend(lines, { "## " .. model_label() .. (t.kind == "error" and " (failed)" or ""), "" })
-    vim.list_extend(lines, vim.split(t.reply, "\n", { plain = true }))
-    lines[#lines + 1] = ""
   end
-  local pending = vim.list_extend(busy[root] and { busy[root] } or {}, queue[root] or {})
-  for i, t in ipairs(pending) do
-    vim.list_extend(lines, { "## You (" .. (i == 1 and "running" or "queued") .. ")", "" })
-    vim.list_extend(lines, vim.split(t.request, "\n", { plain = true }))
-    lines[#lines + 1] = ""
+  local running = busy[root] or foreign[root]
+  for i, entry in ipairs(entries) do
+    if entry.type == "user" then
+      vim.list_extend(lines, { "## You" .. (running and i == last_request and " (running)" or ""), "" })
+      add((entry.text:gsub("\n\n<editor>\n.*\n</editor>$", "")))
+    elseif entry.type == "ai" then
+      local did, reply = {}, {}
+      for _, block in ipairs(entry.blocks or {}) do
+        if block.type == "tool_call" then
+          did[#did + 1] = "- " .. activity(root, block.toolName, block.input)
+        elseif block.type == "text" then
+          reply[#reply + 1] = block.text
+        end
+      end
+      if #did > 0 then
+        vim.list_extend(lines, did)
+        lines[#lines + 1] = ""
+      end
+      if #reply > 0 then
+        vim.list_extend(lines, { "## " .. model_label(), "" })
+        add(table.concat(reply, "\n\n"))
+      end
+    end
   end
-  if #(log[root] or {}) == 0 and #pending == 0 then
-    lines[#lines + 1] = "Nothing asked in this project since Neovim started."
+  for _, t in ipairs(queue[root] or {}) do
+    vim.list_extend(lines, { "## You (queued)", "" })
+    add(t.request)
   end
-  vim.cmd("botright vnew")
-  local b = api.nvim_get_current_buf()
-  vim.bo[b].buftype, vim.bo[b].bufhidden, vim.bo[b].swapfile = "nofile", "wipe", false
-  api.nvim_buf_set_lines(b, 0, -1, false, lines)
-  vim.bo[b].modifiable = false
-  vim.bo[b].filetype = "markdown"
-  pcall(api.nvim_buf_set_name, b, "ai://log")
+  if #lines == 2 then
+    lines[#lines + 1] = "Nothing asked in this project yet."
+  end
+  return lines
 end
 
---- :Ai new: forget the project's conversation; the next request starts a new one.
+--- :Ai log: the conversation so far (every Neovim's requests in the project),
+--- what was done, the replies.
+function M.show_log()
+  local root = project()
+  local function show(entries)
+    local lines = log_lines(root, entries)
+    vim.cmd("botright vnew")
+    local b = api.nvim_get_current_buf()
+    vim.bo[b].buftype, vim.bo[b].bufhidden, vim.bo[b].swapfile = "nofile", "wipe", false
+    api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    vim.bo[b].modifiable = false
+    vim.bo[b].filetype = "markdown"
+    pcall(api.nvim_buf_set_name, b, "ai://log")
+  end
+  find(root, function(err, conv)
+    if err or not conv then
+      return show({})
+    end
+    client:request({
+      type = "load_conversation_history",
+      convId = conv.id,
+      beforeEntryIndex = 1000000000, -- the end
+      turns = 100,
+    }, function(ev)
+      return ev.type == "conversation_history_loaded"
+    end, function(e, ev)
+      show(e and {} or ev.entries)
+    end)
+  end)
+end
+--- :Ai new: end the project's conversation, in every Neovim there; the next
+--- request starts a new one.
 function M.reset()
   local root = project()
-  for _, t in ipairs(queue[root] or {}) do
-    release(t)
-  end
-  queue[root] = nil
-  if busy[root] then
-    busy[root].dropped = true
-  end
-  local conv = convs[root]
-  convs[root] = nil
-  write_state(root, nil)
-  if conv and not conv.ended then
-    conv:delete()
-  end
-  log[root] = nil
-  close_card()
+  drop(root)
+  find(root, function(_, conv)
+    if conv then
+      convs[root] = nil
+      conv:delete()
+    end
+  end)
   vim.notify("A new AI conversation from the next request")
 end
 
@@ -1015,10 +1275,23 @@ function M.setup()
     group = group,
     callback = function()
       if client then
+        -- A request can't go on without the Neovim that runs its tools.
+        for _, turn in pairs(busy) do
+          if turn.conv then
+            turn.conv:abort()
+          end
+        end
         client:close() -- temporary conversations stay for the next Neovim
       end
     end,
   })
+  local function sync()
+    if vim.g.yeyito_ai_sync and #api.nvim_list_uis() > 0 then
+      M.sync()
+    end
+  end
+  api.nvim_create_autocmd("UIEnter", { group = group, once = true, callback = vim.schedule_wrap(sync) })
+  api.nvim_create_autocmd("DirChanged", { group = group, callback = vim.schedule_wrap(sync) })
   vim.keymap.set("n", "<leader>a", function()
     M.open(nil)
   end, { desc = "Ask the AI (Exocortex)" })

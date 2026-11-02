@@ -220,9 +220,6 @@ else
     and done.text == "write_file -> Created made.txt", done)
   check("the card says what it's doing, then the reply", saw_working and (card_lines()[1] or ""):find("✓") ~= nil
     and (card_lines()[2] or ""):find("Created made.txt", 1, true) ~= nil, card_lines())
-  local state = vim.json.decode(table.concat(vim.fn.readfile(vim.fn.stdpath("state") .. "/ai.json"), ""))
-  -- The project as Neovim sees it (on macOS /var/folders is /private/var/folders).
-  check("the project's conversation is remembered", type(state[vim.fs.normalize(vim.fn.getcwd())]) == "string", state)
   done = nil
   ai.ask("count")
   vim.wait(10000, function()
@@ -240,10 +237,18 @@ else
     return done ~= nil
   end, 10)
   check("Ctrl+Q stops it", done and done.kind == "error" and done.text == "Stopped.", done)
-  vim.cmd("Ai log")
-  local log = api.nvim_buf_get_lines(0, 0, -1, false)
-  check(":Ai log: requests, what it did, replies", vim.tbl_contains(log, "- created made.txt") and vim.tbl_contains(log, "turns: 2"), log)
-  vim.cmd("close")
+  local function ai_log()
+    local here = api.nvim_get_current_win()
+    vim.cmd("Ai log")
+    vim.wait(5000, function()
+      return api.nvim_get_current_win() ~= here
+    end, 5)
+    local lines = api.nvim_buf_get_lines(0, 0, -1, false)
+    vim.cmd("close")
+    return lines
+  end
+  local log = ai_log()
+  check(":Ai log: requests, what it did, replies", vim.tbl_contains(log, "- editing made.txt") and vim.tbl_contains(log, "turns: 2"), log)
   vim.cmd("Ai new")
   done = nil
   ai.ask("count")
@@ -270,9 +275,7 @@ else
   ai.ask("count")
   check("queued: nothing refused, nothing run yet", #results == 0, results)
   check("queued: the card says how many", (card_lines()[1] or ""):find("2 queued", 1, true) ~= nil, card_lines())
-  vim.cmd("Ai log")
-  local pending_log = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), "\n")
-  vim.cmd("close")
+  local pending_log = table.concat(ai_log(), "\n")
   check("queued: :Ai log shows what's running and waiting", pending_log:find("## You (running)", 1, true) ~= nil
     and select(2, pending_log:gsub("## You %(queued%)", "")) == 2, pending_log)
   api.nvim_feedkeys(stop_key, "x", false)

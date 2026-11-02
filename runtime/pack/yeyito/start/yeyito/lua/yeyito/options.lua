@@ -13,6 +13,9 @@ local flags = {
   yeyito_sidebar_counts = true,
   -- The model <leader>a and :Ai ask (on the Exocortex daemon; see ai.lua).
   yeyito_ai_model = "claude-sonnet-5-5",
+  -- Neovim joins its folder's AI conversation when it starts, to show what the
+  -- other Neovims there do. Off: only once it's asked something itself.
+  yeyito_ai_sync = true,
 }
 
 function M.setup()

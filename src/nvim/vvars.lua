@@ -289,6 +289,9 @@ M.vars = {
                 was no autocommand.  Except that when
                 only the timestamp changed nothing
                 will happen.
+        keep    Nothing, and the buffer already has what
+                is in the file now: a later |:write| does
+                not warn that the file changed.
         <empty> Nothing, the autocommand should do
                 everything that needs to be done.
       The default is empty.  If another (invalid) value is used then

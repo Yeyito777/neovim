@@ -70,23 +70,51 @@ end
 --- Close the buffers of `path` (or under it) before it goes: windows showing
 --- one show their alternate file, or an empty buffer. Returns what they
 --- showed, to show it again on undo.
-local function close_buffers(path)
+local function close_buffers(path, saved_only)
   local shown = {}
   for _, b in ipairs(buffers_under(path)) do
-    for _, win in ipairs(vim.fn.win_findbuf(b)) do
-      shown[#shown + 1] = { win = win, file = api.nvim_buf_get_name(b) }
-      api.nvim_win_call(win, function()
-        local alt = vim.fn.bufnr("#")
-        if alt > 0 and alt ~= b and vim.bo[alt].buflisted and vim.bo[alt].buftype == "" then
-          vim.cmd("silent buffer " .. alt)
-        else
-          vim.cmd("silent enew")
-        end
-      end)
+    if not (saved_only and vim.bo[b].modified) then
+      for _, win in ipairs(vim.fn.win_findbuf(b)) do
+        shown[#shown + 1] = { win = win, file = api.nvim_buf_get_name(b) }
+        api.nvim_win_call(win, function()
+          local alt = vim.fn.bufnr("#")
+          if alt > 0 and alt ~= b and vim.bo[alt].buflisted and vim.bo[alt].buftype == "" then
+            vim.cmd("silent buffer " .. alt)
+          else
+            vim.cmd("silent enew")
+          end
+        end)
+      end
+      pcall(api.nvim_buf_delete, b, { force = true })
     end
-    pcall(api.nvim_buf_delete, b, { force = true })
   end
   return shown
+end
+
+--- Another Neovim deleted `path`: what's open of it closes, unless it has
+--- unsaved changes.
+function M.deleted_elsewhere(path)
+  close_buffers(path, true)
+end
+
+--- Another Neovim moved `from` to `to`: what's open of it follows, in its
+--- windows, unless it has unsaved changes.
+function M.moved_elsewhere(from, to)
+  for _, b in ipairs(buffers_under(from)) do
+    if not vim.bo[b].modified then
+      local new = vim.fn.bufadd(to .. vim.fs.normalize(api.nvim_buf_get_name(b)):sub(#from + 1))
+      vim.fn.bufload(new)
+      vim.bo[new].buflisted = vim.bo[b].buflisted
+      for _, win in ipairs(vim.fn.win_findbuf(b)) do
+        local view = api.nvim_win_call(win, vim.fn.winsaveview)
+        api.nvim_win_set_buf(win, new)
+        api.nvim_win_call(win, function()
+          vim.fn.winrestview(view)
+        end)
+      end
+      pcall(api.nvim_buf_delete, b, { force = true })
+    end
+  end
 end
 
 local function show_again(shown)

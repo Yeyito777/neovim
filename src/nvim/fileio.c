@@ -2997,6 +2997,11 @@ int buf_check_timestamp(buf_T *buf)
           reload = RELOAD_DETECT;
         } else if (strcmp(s, "ask") == 0) {
           n = false;
+        } else if (strcmp(s, "keep") == 0) {
+          // The buffer has what's in the file now: a :write has nothing to warn about.
+          buf->b_mtime_read = buf->b_mtime;
+          buf->b_mtime_read_ns = buf->b_mtime_ns;
+          return 2;
         } else {
           return 2;
         }
