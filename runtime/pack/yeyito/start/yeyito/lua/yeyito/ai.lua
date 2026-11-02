@@ -899,50 +899,94 @@ end
 
 -- ── The other Neovims in the folder ───────────────────────────────────────
 
---- Another Neovim's request changed `path`: this buffer shows it the way the
---- asker's does (tinted, one u). Its unsaved changes keep it out of this, and
---- Vim warns about the file as usual.
-local function sync_file(path, turn)
-  local b = vim.fn.bufnr(path)
-  if b <= 0 or not api.nvim_buf_is_loaded(b) or vim.bo[b].modified then
-    return
+--- Can this buffer show another Neovim's edit as an edit? Its unsaved changes
+--- keep it out of this, and Vim warns about the file as usual; a CRLF file or
+--- another encoding is left to 'autoread'.
+local function followable(b)
+  if not api.nvim_buf_is_loaded(b) then
+    return false
   end
-  local f = io.open(path, "rb")
-  if not f then
-    return
-  end
-  local data = f:read("*a")
-  f:close()
-  -- Otherwise (a CRLF file, another encoding) it's left to 'autoread'.
-  if vim.bo[b].fileformat == "unix" and (vim.bo[b].fileencoding == "" or vim.bo[b].fileencoding == "utf-8") then
-    apply(b, split(data), turn)
-    vim.bo[b].modified = false
-    -- This buffer has the file now: 'autoread' must not read it over the tint,
-    -- nor :write warn about it. Without 'autoread' a change on disk runs this
-    -- autocmd instead of reloading; "keep" is a patch of this fork.
-    local absorb = api.nvim_create_autocmd("FileChangedShell", {
-      buffer = b,
-      callback = function()
-        vim.v.fcs_choice = "keep"
-      end,
-    })
+  local bo = vim.bo[b]
+  return not bo.modified and bo.fileformat == "unix" and (bo.fileencoding == "" or bo.fileencoding == "utf-8")
+end
+
+--- Another Neovim's request is writing this buffer's file. Until `let_go` the
+--- reload timer can't read it over the green: without 'autoread' a change on disk
+--- runs this autocmd instead, and "keep" (a patch of this fork) says the buffer
+--- has the file, so that :write doesn't warn about it. Returns the hold, if any.
+local function hold(b, turn)
+  local held = turn.held[b]
+  if held then
+    held.calls = held.calls + 1
+  elseif followable(b) then
     vim.bo[b].autoread = false
-    pcall(vim.cmd, "silent! checktime " .. b)
-    api.nvim_buf_call(b, function()
-      vim.cmd("setlocal autoread<")
-    end)
-    api.nvim_del_autocmd(absorb)
+    held = {
+      calls = 1,
+      autocmd = api.nvim_create_autocmd("FileChangedShell", {
+        buffer = b,
+        callback = function()
+          local reason = vim.v.fcs_reason
+          vim.v.fcs_choice = (reason == "conflict" or reason == "deleted") and "ask" or "keep"
+        end,
+      }),
+    }
+    turn.held[b] = held
+  end
+  return held
+end
+
+--- The buffer shows what's in its file, the way the asker's does (green, one u).
+local function show_file(b, turn)
+  if followable(b) then
+    local f = io.open(api.nvim_buf_get_name(b), "rb")
+    if f then
+      local data = f:read("*a")
+      f:close()
+      apply(b, split(data), turn)
+      vim.bo[b].modified = false
+    end
   end
 end
 
---- What another Neovim's tool call did, done here too.
-local function follow_tool(root, call, turn)
+local function let_go(b, turn)
+  local held = turn.held[b]
+  turn.held[b] = nil
+  if api.nvim_buf_is_loaded(b) then
+    pcall(vim.cmd, "silent! checktime " .. b) -- the change on disk, if the timer hasn't seen it
+    api.nvim_buf_call(b, function()
+      vim.cmd("setlocal autoread<")
+    end)
+  end
+  pcall(api.nvim_del_autocmd, held.autocmd)
+end
+
+--- Its end: any buffer still held shows its file.
+local function let_all_go(turn)
+  for b in pairs(turn.held) do
+    show_file(b, turn)
+    let_go(b, turn)
+  end
+end
+
+--- What another Neovim's tool call did, done here too. `failed`: nothing did,
+--- but its file is let go.
+local function follow_tool(root, call, turn, failed)
   local name, input = call.name, call.input
   local sidebar = require("yeyito.sidebar")
   if name == "edit_file" or name == "write_file" then
     local path = resolve(root, input.path)
-    sync_file(path, turn)
+    local b = vim.fn.bufnr(path)
+    local held = b > 0 and (turn.held[b] or hold(b, turn))
+    if held then
+      show_file(b, turn)
+      held.calls = held.calls - 1
+      if held.calls <= 0 then
+        let_go(b, turn)
+      end
+    end
     sidebar.changed(path)
+  elseif failed then
+    return
   elseif name == "move_path" then
     local from, to = resolve(root, input.from), resolve(root, input.to)
     files.moved_elsewhere(from, to)
@@ -957,6 +1001,7 @@ end
 --- Another Neovim's request ended (`kind`, `text`: how, unless that's unknown):
 --- what it did by other means shows, and this Neovim's next request can run.
 local function foreign_ended(root, kind, text)
+  let_all_go(foreign[root])
   foreign[root] = nil
   pcall(vim.cmd, "silent! checktime")
   require("yeyito.sidebar").changed()
@@ -975,7 +1020,7 @@ following = function(root)
   if foreign[root] then
     return foreign[root]
   end
-  local turn = { touched = {}, calls = {} }
+  local turn = { touched = {}, calls = {}, held = {} }
   foreign[root] = turn
   if root == project() then
     card.root, card.lines = root, {}
@@ -1019,7 +1064,10 @@ local function drop(root)
   if busy[root] then
     busy[root].dropped = true
   end
-  foreign[root] = nil
+  if foreign[root] then
+    let_all_go(foreign[root])
+    foreign[root] = nil
+  end
   close_card()
 end
 
@@ -1054,18 +1102,26 @@ local function daemon_event(ev)
   elseif t == "streaming_started" or t == "user_message" or t == "turn_catchup" then
     following(root)
   elseif t == "tool_call" then
-    following(root).calls[ev.toolCallId] = {
+    local turn = following(root)
+    local call = {
       name = tostring(ev.toolName):gsub("^mcp__app__", ""),
       input = type(ev.input) == "table" and ev.input or {},
     }
+    turn.calls[ev.toolCallId] = call
+    if call.name == "edit_file" or call.name == "write_file" then
+      local b = vim.fn.bufnr(resolve(root, call.input.path))
+      if b > 0 then
+        hold(b, turn)
+      end
+    end
     if root == project() then
       show_working(activity(root, ev.toolName, ev.input))
     end
   elseif t == "tool_result" then
     local turn = foreign[root]
     local call = turn and turn.calls[ev.toolCallId]
-    if call and not ev.isError then
-      follow_tool(root, call, turn)
+    if call then
+      follow_tool(root, call, turn, ev.isError)
     end
   elseif t == "turn_result" and foreign[root] then
     if ev.stopReason == "aborted" then

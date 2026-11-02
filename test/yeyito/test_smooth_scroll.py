@@ -459,7 +459,7 @@ def floats():
     # Everything that moves or changes lines, under floats that overlap the
     # window every way, with double-width text cut by their edges; beside the
     # sidebar and in splits, with and without smooth scrolling.
-    keys = [b"\x05", b"\x05", b"\x19", b"\x04", b"\x15", b"\x06", b"\x02", b"3\x05", b"3\x19", b"j", b"k", b"L",
+    keys = [b"\x05", b"\x05", b"\x19", b"\x04", b"\x15", b"\x06", b"\x02", b"3\x05", b"3\x19", b"j", b"k", b"J", b"K", b"L",
             b"Lj", b"Hk", b"zz", b"zt", b"zb", b"gg", b"G", b"dd", b"u", b"ox\x1b", b"u", b"20j", b"20k", b"p", b"u",
             b"Jx", b"u", b"zL", b"zH", b":set wrap!\r", b"\x1b", b"i\x18\x05\x1b", b"i\x18\x19\x1b", b"ohello \x18\x0e\x18\x05\x18\x05\x1b", b"u"]
     setups = [
@@ -516,6 +516,10 @@ def main():
         check("CTRL-B glides a page back", glides(t.keys(b"\x02")) == [-(WIN_H - 2) * 1000])
         check("wheel glides", glides(t.keys(b"\x1b[<65;10;10M")) == [3000])
         check("j at the bottom edge glides", glides(t.keys(b"L") + t.keys(b"j")) == [1000])
+        got = glides(t.keys(b"H") + t.keys(b"J"))
+        check("J inside the view doesn't glide", got == [], got)
+        got = glides(t.keys(b"L") + t.keys(b"J"))
+        check("J at the bottom edge glides, just far enough", len(got) == 1 and got[0] > 1000, got)
         check("rectangle sent once per window", RECT.search(t.keys(b"\x05")) is None)
 
         out = t.keys(b"10Gdd")

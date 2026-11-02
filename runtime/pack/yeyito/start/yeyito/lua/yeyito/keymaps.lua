@@ -57,7 +57,25 @@ local function jump_to_screen_percent(percent)
   vim.fn.winrestview(view)
 end
 
+-- Shift+J/K: as many j/k presses as an eighth of the window, as in Exocortex.
+-- The column stays, and the view only moves past its edges.
+local function eighth(motion)
+  return function()
+    local rows = math.max(1, math.floor(math.floor(vim.api.nvim_win_get_height(0) / 2) / 4))
+    vim.cmd("normal! " .. rows * vim.v.count1 .. motion)
+  end
+end
+
 function M.setup()
+  map({ "n", "x" }, "J", eighth("j"), { desc = "Down an eighth of the window" })
+  map({ "n", "x" }, "K", eighth("k"), { desc = "Up an eighth of the window" })
+  -- ; looks up what's under the cursor (stock Vim's K): the language server's
+  -- hover, else 'keywordprg'.
+  map("n", ";", function()
+    local hover = next(vim.lsp.get_clients({ bufnr = 0, method = "textDocument/hover" }))
+    return hover and "<Cmd>lua vim.lsp.buf.hover()<CR>" or "K"
+  end, { expr = true, desc = "Look up what's under the cursor" })
+
   -- Diagnostics
   map("n", "gl", vim.diagnostic.open_float)
   map("n", "]e", function() jump(1, vim.diagnostic.severity.ERROR) end, { desc = "Next error" })

@@ -39,7 +39,6 @@ class Neovim:
     SETUP = """
       _G.ai = require("yeyito.ai")
       ai.context = false
-      vim.o.updatetime = 100000 -- no CursorHold checktime in the moment a file changes (it costs that edit's tint)
       _G.did, _G.done = {}, {}
       ai.on_did = function(what) did[#did + 1] = what end
       ai.on_done = function(kind, text) done[#done + 1] = kind .. ": " .. text end
@@ -202,6 +201,37 @@ def main():
         b.do('vim.cmd("silent normal! u")')
         check("one u undoes what the other's request did", b.lines() == ["one", "TWO", "three"], b.lines())
         b.do('vim.cmd("silent edit!")')
+
+        # The reload timer can't read the file over the green while the asker
+        # writes it (here the asker waits 600 ms between writing and answering).
+        write("held.txt", "first", "second")
+        a.edit("held.txt")
+        b.do("ai.on_did = function(what) did[#did + 1] = what; vim.wait(600) end")
+        a.do("done = {}")
+        b.do("done = {}")
+        b.ask(tool("edit_file", path="held.txt", old_string="second", new_string="SECOND"))
+        wait_for(lambda: disk("held.txt") == ["first", "SECOND"])
+        a.do('vim.cmd("silent! checktime")')
+        check("while it's being written: not read over the green", a.lines() == ["first", "second"] and a.lua("vim.bo.autoread") is False, a.lines())
+        wait_for(lambda: b.lua("done[1]"))
+        check("then it's an edit", wait_for(lambda: a.lines() == ["first", "SECOND"]) and a.green() == 1, (a.lines(), a.green()))
+        check("no reload was reported", "Buffer reloaded" not in a.expr('execute("messages")'))
+        check("the buffer is let go", wait_for(lambda: a.lua("vim.bo.autoread") is True))
+        a.do('vim.cmd("silent write")')
+        check("and it can be written without a warning", a.lua("vim.bo.modified") is False, a.expr('execute("messages")'))
+
+        # Unsaved changes made in that moment stay yours, with Vim's warning.
+        b.do("done = {}")
+        b.ask(tool("edit_file", path="held.txt", old_string="first", new_string="FIRST"))
+        wait_for(lambda: disk("held.txt") == ["FIRST", "SECOND"])
+        a.do('vim.api.nvim_buf_set_lines(0, 1, 2, false, {"SECOND mine"})')
+        wait_for(lambda: b.lua("done[1]"))
+        time.sleep(0.2)
+        check("unsaved changes made while it's being written stay", a.lines() == ["first", "SECOND mine"] and a.lua("vim.bo.modified") is True, a.lines())
+        check("and it's let go", a.lua("vim.bo.autoread") is True)
+        a.do('vim.cmd("silent edit!")')
+        b.do("ai.on_did = function(what) did[#did + 1] = what end")
+        a.edit("app.py")
 
         # Unsaved changes stay.
         b.do('vim.api.nvim_buf_set_lines(0, 2, 3, false, {"three mine"})')

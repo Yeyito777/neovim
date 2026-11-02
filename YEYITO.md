@@ -120,6 +120,17 @@ Machine-local tweaks, if ever needed, go in `~/.config/nvim/after/plugin/*.lua`
 (it runs after the built-in config; a plain `~/.config/nvim/init.lua` runs
 before it and gets overridden).
 
+## Shift+J/K and `;`
+
+In `keymaps.lua`:
+
+- **Shift+J/K** (normal and visual modes): down and up an eighth of the window,
+  as in Exocortex's history. It's that many `j`/`k` presses: the column stays and
+  the view only moves past its edges. A count multiplies it. `gJ` and `:join`
+  still join lines.
+- **`;`**: looks up what's under the cursor, stock Vim's `K`: the language
+  server's hover, else `'keywordprg'`. In the sidebar it stays the actions menu.
+
 ## Smooth scrolling
 
 The Exocortex TUI's smooth scrolling, in Neovim. When st supports it (DECRQM
@@ -394,8 +405,8 @@ config is also on GitHub as `Yeyito777/neovim-config` (archived).
 
 ## Ideas (from the old config's TODO.md)
 
-- Auto-document `K`/`gd` results with AI.
-- Keep the `K` hover window up until the cursor leaves the line.
+- Auto-document `;`/`gd` results with AI.
+- Keep the `;` hover window up until the cursor leaves the line.
 - Try a Copilot-like completion.
 - An in-editor AI chat with access to the project, file and selection.
 - An underscore text object (`di_`, `da_`, `vi_`, `va_`).
