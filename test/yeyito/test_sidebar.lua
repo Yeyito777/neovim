@@ -985,7 +985,7 @@ local function new_file_steps()
     vim.cmd.edit(S.dir .. "/d.txt")
     S.order_of = function()
       local saved = vim.json.decode(table.concat(vim.fn.readfile(S.order), ""))
-      return saved[S.dir]
+      return saved[vim.fs.normalize(vim.fn.getcwd())] -- on macOS /var/folders is /private/var/folders
     end
     send("<C-p>")
   end)
