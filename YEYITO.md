@@ -249,11 +249,12 @@ Exocortex's sidebar keys work on files too:
   renaming, moving, creating, duplicating), for as long as Neovim runs.
 - **`Ctrl+P`** (from the sidebar or the editor): a new file in the folder
   under the sidebar's cursor (or the selected file's folder); it opens in the
-  editor. A name ending in `/` makes a folder. **`Ctrl+Shift+O`**: at the top
-  of the project, wherever the cursor is (as in Exocortex; st sends it as
-  `CSI 111;6u`, which Neovim reads as `<C-S-O>`). Without the sidebar,
-  `Ctrl+P` makes it in the current file's folder. Insert mode's `Ctrl+P`
-  still completes.
+  editor and goes right below the selected file, or at the top of the folder
+  when the cursor is on a folder. A name ending in `/` makes a folder.
+  **`Ctrl+Shift+O`**: at the very top of the project, wherever the cursor is (as
+  in Exocortex; st sends it as `CSI 111;6u`, which Neovim reads as `<C-S-O>`).
+  Without the sidebar, `Ctrl+P` makes it right below the current file. Insert
+  mode's `Ctrl+P` still completes.
 - **`f`** new folder, **`r`** rename (from the current name), **`c`**
   duplicate (`name copy.ext`), **`F`** move into a folder of the project (Tab
   completes; empty or `/` is the top, `..` one up), **`<`** move out of its
@@ -267,9 +268,10 @@ Exocortex's sidebar keys work on files too:
 - **`e`** / **`E`**: move the file or folder up / down one in its folder;
   **Ctrl+E**: to its top (above folders too). With rows selected (`V`), they
   move together and stay selected. The folder keeps that order, across
-  sessions (`sidebar-order.json` in Neovim's state folder); a new file goes
-  where the alphabetical order puts it, after its neighbour, and a renamed
-  one keeps its place.
+  sessions (`sidebar-order.json` in Neovim's state folder). A file made with
+  `Ctrl+P` or `c` goes right below the one in focus; one made by anything else
+  (the shell, the AI) goes where the alphabetical order puts it, after its
+  neighbour; a renamed one keeps its place.
 - **`;`** or a right click: the actions menu beside the row (Rename,
   Duplicate, Move, Copy path, Delete, which asks "You sure?"; on a folder
   also New file and New folder). `j`/`k`, Enter or a click, Esc.

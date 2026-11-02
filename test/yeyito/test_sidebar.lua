@@ -857,9 +857,174 @@ local function done_steps()
   return steps
 end
 
+-- Where a new file goes: right below the file in focus, else at the top.
+local function new_file_steps()
+  local steps = {}
+  local function step(fn)
+    steps[#steps + 1] = fn
+  end
+  local function send(k)
+    api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "m", false)
+  end
+  local S = {}
+  local sidebar = require("yeyito.sidebar")
+  local function lines()
+    return vim.tbl_map(vim.trim, api.nvim_buf_get_lines(S.buf, 0, -1, true))
+  end
+  local function select(name)
+    api.nvim_set_current_win(S.side)
+    for i, line in ipairs(lines()) do
+      if line == name then
+        api.nvim_win_set_cursor(S.side, { i, 0 })
+        return
+      end
+    end
+    error("no row " .. name .. " in " .. vim.inspect(lines()))
+  end
+  local function selected()
+    local row = api.nvim_win_get_cursor(S.side)[1]
+    return vim.trim(api.nvim_buf_get_lines(S.buf, row - 1, row, true)[1])
+  end
+  local function new_file(on, name, fn)
+    step(function()
+      if on then
+        select(on)
+      end
+      send("<C-p>")
+    end)
+    step(function()
+      send(name .. "<CR>")
+    end)
+    step(fn)
+  end
+
+  step(function()
+    S.dir = vim.fs.normalize(vim.fn.tempname())
+    S.order = vim.fn.tempname() .. "-order.json"
+    sidebar._order_file(S.order)
+    require("yeyito.files").trash_root = vim.fs.normalize(vim.fn.tempname())
+    S.trash = require("yeyito.files").trash_root
+    vim.fn.mkdir(S.dir .. "/lib", "p")
+    vim.fn.mkdir(S.dir .. "/other", "p")
+    for _, f in ipairs({ "b.txt", "d.txt", "lib/x.txt", "lib/y.txt", "other/z.txt" }) do
+      vim.fn.writefile({ "x" }, S.dir .. "/" .. f)
+    end
+    vim.cmd("tabnew")
+    vim.cmd.cd(S.dir)
+    vim.cmd.edit("d.txt")
+    S.editor = api.nvim_get_current_win()
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+  end)
+  new_file("b.txt", "zz.txt", function()
+    check("on a file: right below it, whatever its name", vim.deep_equal(lines(), { "📁 lib/", "📁 other/", "b.txt", "zz.txt", "d.txt" }), lines())
+    check("the new file opens in the editor", vim.fs.basename(api.nvim_buf_get_name(api.nvim_win_get_buf(S.editor))) == "zz.txt"
+      and api.nvim_get_current_win() == S.editor)
+    check("the sidebar's cursor is on it", selected() == "zz.txt", selected())
+  end)
+  new_file("zz.txt", "aa.txt", function()
+    check("again, below the one just made", vim.deep_equal(lines(), { "📁 lib/", "📁 other/", "b.txt", "zz.txt", "aa.txt", "d.txt" }), lines())
+  end)
+  new_file("📁 other/", "new.txt", function()
+    check("on a folder: at the top of it, open", vim.deep_equal(lines(), { "📁 lib/", "📂 other/", "new.txt", "z.txt", "b.txt", "zz.txt", "aa.txt", "d.txt" }), lines())
+    select("📂 other/")
+    send("<CR>")
+  end)
+  new_file("b.txt", "other/under.txt", function()
+    check("named into another folder: at the top of that one", vim.deep_equal(lines(), { "📁 lib/", "📂 other/", "under.txt", "new.txt", "z.txt", "b.txt", "zz.txt", "aa.txt", "d.txt" }), lines())
+    select("📁 lib/")
+    send("<CR>")
+  end)
+  step(function()
+    select("x.txt")
+    send("<C-S-o>")
+  end)
+  step(function()
+    send("top1.txt<CR>")
+  end)
+  step(function()
+    check("Ctrl+Shift+O: the very top of the project, above folders", lines()[1] == "top1.txt", lines())
+    select("b.txt")
+    send("<C-S-o>")
+  end)
+  step(function()
+    send("top2.txt<CR>")
+  end)
+  step(function()
+    check("from a file of that folder too", lines()[1] == "top2.txt" and lines()[2] == "top1.txt", lines())
+    S.before = lines()
+    select("d.txt")
+    send("c")
+  end)
+  step(function()
+    vim.wait(2000, function()
+      return vim.tbl_contains(lines(), "d copy.txt")
+    end, 10)
+    check("c: the copy right below it", lines()[#lines()] == "d copy.txt" and lines()[#lines() - 1] == "d.txt"
+      and selected() == "d copy.txt", lines())
+    S.keep = lines()
+    send("u")
+  end)
+  step(function()
+    check("u: it goes, and nothing else moves", vim.deep_equal(lines(), S.before), lines())
+    sidebar._order_file(S.order) -- read again from the file
+    keys("R")
+  end)
+  step(function()
+    check("the places are kept", vim.deep_equal(lines(), S.before), lines())
+    select("b.txt")
+    send("<C-p>")
+  end)
+  step(function()
+    send("afolder/<CR>")
+  end)
+  step(function()
+    check("a folder stays where the sort puts it, not below the file", lines()[1] == "📂 afolder/", lines())
+    sidebar.close()
+    api.nvim_set_current_win(S.editor)
+    vim.cmd.edit(S.dir .. "/d.txt")
+    S.order_of = function()
+      local saved = vim.json.decode(table.concat(vim.fn.readfile(S.order), ""))
+      return saved[S.dir]
+    end
+    send("<C-p>")
+  end)
+  step(function()
+    send("after_d.txt<CR>")
+  end)
+  step(function()
+    local names = S.order_of()
+    local d
+    for i, n in ipairs(names) do
+      if n == "d.txt" then
+        d = i
+      end
+    end
+    check("no sidebar: right below the current file", d and names[d + 1] == "after_d.txt", names)
+    vim.cmd("enew")
+    send("<C-p>")
+  end)
+  step(function()
+    send("first.txt<CR>")
+  end)
+  step(function()
+    check("no sidebar, no file: at the top", S.order_of()[1] == "first.txt", S.order_of())
+    sidebar._order_file(nil)
+    require("yeyito.files").trash_root = nil
+    vim.fn.delete(S.dir, "rf")
+    vim.fn.delete(S.trash, "rf")
+    os.remove(S.order)
+    vim.cmd("tabclose")
+  end)
+  return steps
+end
+
+-- The other tests make files too: not in the user's order file, if they run outside a test state.
+require("yeyito.sidebar")._order_file(vim.fn.tempname() .. "-order.json")
 local steps = search_steps()
 vim.list_extend(steps, file_steps())
 vim.list_extend(steps, done_steps())
+vim.list_extend(steps, new_file_steps())
 vim.list_extend(steps, order_steps())
 local function next_step(i)
   if i > #steps then

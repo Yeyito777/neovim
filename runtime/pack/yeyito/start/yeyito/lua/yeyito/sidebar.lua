@@ -248,6 +248,25 @@ local function scan(dir)
   return list
 end
 
+--- A file just made: right below `after` (a path) if that's in the same folder,
+--- else at the top of its folder (above folders too).
+local function place_new(path, after)
+  local parent, name = vim.fs.dirname(path), vim.fs.basename(path)
+  local names, at = {}, 1
+  for _, e in ipairs(scan(parent)) do
+    if e.name ~= name then
+      names[#names + 1] = e.name
+      if e.path == after then
+        at = #names + 1
+      end
+    end
+  end
+  table.insert(names, at, name)
+  load_order()[parent] = names
+  save_order()
+  children[parent] = nil
+end
+
 -- Tree order (folders first, case-insensitive) for project-relative entries
 -- with `rel` and `dir`.
 local function parts_of(e)
@@ -2164,8 +2183,9 @@ local function in_folder(dir)
 end
 
 --- Create the file (or folder: a name ending in /) `input` names in `dir`;
---- a file opens in the editor, which gets the focus. Returns why not.
-local function create(dir, input, as_dir)
+--- a file opens in the editor, which gets the focus, and goes right below `after`,
+--- the file in focus, or else at the top of its folder. Returns why not.
+local function create(dir, input, as_dir, after)
   input = vim.trim(input)
   if input == "" then
     return
@@ -2178,6 +2198,8 @@ local function create(dir, input, as_dir)
   end
   if is_dir then
     expanded[path] = true
+  else
+    place_new(path, after)
   end
   if sidebar_win() then
     after_change(path)
@@ -2190,37 +2212,42 @@ local function create(dir, input, as_dir)
   end
 end
 
-local function new_file_in(dir)
+local function new_file_in(dir, after)
   prompt({
     title = "New file" .. in_folder(dir),
     placeholder = "name (a / at the end: a folder)",
     on_submit = function(input)
-      return create(dir, input)
+      return create(dir, input, false, after)
     end,
   })
 end
 
---- Ctrl+P: a new file in the folder under the sidebar's cursor (`top`, as
---- Ctrl+Shift+O: at the top of the project). Without the sidebar, in the
---- current file's folder.
+--- Ctrl+P: a new file in the folder under the sidebar's cursor, right below the
+--- file the cursor is on, or at the top of that folder (`top`, as Ctrl+Shift+O: at
+--- the top of the project). Without the sidebar, the current file is the one.
 function M.new_file(top)
-  if sidebar_win() then
+  local side = sidebar_win()
+  if side then
+    local row = cursor_row(side)
+    local after = not top and row and not row.dir and row.path or nil
     clear_pending()
     leave_visual()
-    new_file_in(top and root or cursor_folder())
+    new_file_in(top and root or cursor_folder(), after)
     return
   end
   local name = api.nvim_buf_get_name(0)
   local dir = vim.fs.normalize(vim.fn.getcwd())
+  local after
   if not top and name ~= "" and vim.bo.buftype == "" then
-    dir = vim.fs.dirname(vim.fs.normalize(name))
+    after = vim.fs.normalize(name)
+    dir = vim.fs.dirname(after)
   end
   local cwd = vim.fs.normalize(vim.fn.getcwd())
   prompt({
     title = "New file" .. (dir == cwd and "" or " in " .. vim.fn.fnamemodify(dir, ":~:.") .. "/"),
     placeholder = "name (a / at the end: a folder)",
     on_submit = function(input)
-      return create(dir, input)
+      return create(dir, input, false, after)
     end,
   })
 end
@@ -2580,6 +2607,7 @@ local function duplicate(row)
     if not to then
       return fail(err)
     end
+    place_new(to, row.path)
     after_change(to)
   end)
 end
