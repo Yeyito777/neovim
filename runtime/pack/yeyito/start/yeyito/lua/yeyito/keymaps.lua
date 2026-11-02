@@ -119,6 +119,16 @@ function M.setup()
     end, { desc = string.format("Jump to %d%% of screen", pct) })
   end
 
+  -- The visual range shows as "[+ 12 lines]" (ui2/cmdline.lua): deleting it takes it whole.
+  for _, key in ipairs({ "<BS>", "<C-w>" }) do
+    map("c", key, function()
+      if vim.fn.getcmdtype() == ":" and vim.fn.getcmdpos() == 6 and vim.fn.getcmdline():sub(1, 5) == "'<,'>" then
+        return ("<BS>"):rep(5)
+      end
+      return key
+    end, { expr = true, desc = "Delete, the visual range in one go" })
+  end
+
   -- Insert mode convenience bindings
   map("i", "<C-l>", "<CR>", { desc = "Insert newline" })
 

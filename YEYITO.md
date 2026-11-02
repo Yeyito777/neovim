@@ -26,6 +26,9 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
   pager and dialogs right of the first `n` columns, so the file sidebar can run
   the full height. `vim._core.ui2` is compiled into the binary: rebuild after
   editing it.
+- **Visual range label** (Lua, `runtime/lua/vim/_core/ui2/cmdline.lua`): `:` in
+  visual mode shows `[+ 12 lines]` instead of `'<,'>` and keeps the selection
+  highlighted (see [Command line and messages](#command-line-and-messages)).
 - **Bundled parsers**: python cpp java bash javascript typescript tsx html css
   rust, besides upstream's c lua vim vimdoc query markdown
   (`cmake.deps/deps.txt`, pinned to nvim-treesitter's lockfile).
@@ -309,6 +312,12 @@ lets them sit beside the sidebar. Differences from the classic command line:
   `q` closes it.
 - Prompts (`:s///c`, confirm dialogs) appear in a dialog window above the
   command line.
+
+- `:` in visual mode shows `[+ 12 lines]` (dim) in place of `'<,'>`, and the
+  lines stay highlighted while you type. Only the display changes: the command
+  still has the range (`getcmdline()`, history, what runs), so it works on any
+  command. Backspace right after it takes it whole. It's the fork's patch to
+  `runtime/lua/vim/_core/ui2/cmdline.lua`.
 
 `g:yeyito_ui2 = v:false` in `~/.config/nvim/init.lua` goes back to the classic
 command line (the sidebar then ends above it, as before).

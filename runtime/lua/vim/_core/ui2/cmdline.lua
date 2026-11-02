@@ -39,6 +39,98 @@ end
 
 local cmdbuff = '' ---@type string Stored cmdline used to calculate translation offset.
 local promptlen = 0 -- Current length of the last line in the prompt.
+
+-- Fork: a cmdline starting with the visual range shows "[+ 12 lines]" in its
+-- place and keeps those lines highlighted. Only the display: the cmdline itself
+-- (getcmdline(), history, what runs) still has the range.
+local VISUAL_RANGE = "'<,'>"
+local range_label = '' -- What shows in place of the range; empty when it isn't there.
+local range_bytes = 0 -- Bytes of the cmdline the label replaces.
+local selection_ns = api.nvim_create_namespace('nvim.ui2.selection')
+local selection_buf ---@type integer? Buffer whose selection is highlighted.
+
+local function clear_selection()
+  if selection_buf and api.nvim_buf_is_valid(selection_buf) then
+    api.nvim_buf_clear_namespace(selection_buf, selection_ns, 0, -1)
+  end
+  selection_buf = nil
+end
+
+local function show_selection()
+  local buf = api.nvim_get_current_buf()
+  if selection_buf == buf then
+    return
+  end
+  clear_selection()
+  selection_buf = buf
+  local mode = fn.visualmode()
+  local priority = vim.hl.priorities.user
+  if mode == '\22' then
+    local inclusive = vim.o.selection ~= 'exclusive'
+    vim.hl.range(buf, selection_ns, 'Visual', "'<", "'>", { regtype = mode, inclusive = inclusive, priority = priority })
+    return
+  end
+  -- One mark however many lines (vim.hl.range lists them all: 0.4 s for 300k).
+  local first, last = fn.getpos("'<"), fn.getpos("'>")
+  local opts = { hl_group = 'Visual', priority = priority, strict = false }
+  if mode ~= 'v' or last[3] == vim.v.maxcol then
+    opts.end_row, opts.end_col = last[2], 0
+  else
+    local line = api.nvim_buf_get_lines(buf, last[2] - 1, last[2], false)[1] or ''
+    local col = math.min(last[3], #line)
+    opts.end_row = last[2] - 1
+    opts.end_col = col > 0 and vim.o.selection ~= 'exclusive' and col + vim.str_utf_end(line, col) or math.max(col - 1, 0)
+  end
+  api.nvim_buf_set_extmark(buf, selection_ns, first[2] - 1, mode == 'v' and first[3] - 1 or 0, opts)
+  -- A blank line shows one cell of the selection, as in visual mode. Under an
+  -- indent guide (priority), and only the lines on screen.
+  local top = math.max(first[2], fn.line('w0'))
+  for i, line in ipairs(api.nvim_buf_get_lines(buf, top - 1, math.min(last[2], fn.line('w$')), false)) do
+    if line == '' then
+      api.nvim_buf_set_extmark(buf, selection_ns, top + i - 2, 0, {
+        virt_text = { { ' ', 'Visual' } },
+        virt_text_pos = 'overlay',
+        priority = 0,
+      })
+    end
+  end
+end
+
+--- A column of the real cmdline where the label shows instead of the range.
+---
+---@param col integer
+---@return integer
+local function shown_col(col)
+  if range_bytes == 0 or col <= promptlen then
+    return col
+  end
+  return math.max(col, promptlen + range_bytes) + #range_label - range_bytes
+end
+
+--- Set the label for what is on the cmdline now, and the highlight that goes with it.
+---
+---@param prompt string
+local function update_range_label(prompt)
+  local first, last = fn.line("'<"), fn.line("'>")
+  if
+    prompt == ':'
+    and M.level == 1
+    and M.srow == 0
+    and first > 0
+    and cmdbuff:sub(1, #VISUAL_RANGE) == VISUAL_RANGE
+  then
+    local count = last - first + 1
+    range_label = ('[+ %d line%s] '):format(count, count == 1 and '' or 's')
+    range_bytes = #VISUAL_RANGE
+    show_selection()
+  else
+    range_label, range_bytes = '', 0
+    if M.level == 1 then
+      clear_selection()
+    end
+  end
+end
+
 --- Concatenate content chunks and set the text for the current row in the cmdline buffer.
 ---
 ---@alias CmdChunk [integer, string]
@@ -55,8 +147,19 @@ local function set_text(content, prompt, hl_id)
   for _, chunk in ipairs(content) do
     cmdbuff = cmdbuff .. chunk[2]
   end
-  lines[#lines] = ('%s%s '):format(lines[#lines], fn.strtrans(cmdbuff))
+  update_range_label(prompt)
+  local real_line = ('%s%s '):format(lines[#lines], fn.strtrans(cmdbuff))
+  lines[#lines] = ('%s%s%s '):format(lines[#lines], range_label, fn.strtrans(cmdbuff:sub(range_bytes + 1)))
   api.nvim_buf_set_lines(ui.bufs.cmd, M.srow, -1, false, lines)
+  if range_bytes > 0 then
+    api.nvim_buf_set_extmark(ui.bufs.cmd, ui.ns, M.srow, promptlen, {
+      invalidate = true,
+      undo_restore = false,
+      end_col = promptlen + #range_label,
+      hl_group = 'YeyitoCmdRange',
+      priority = vim.hl.priorities.user, -- Over what the line parses to.
+    })
+  end
 
   -- Highlight prompt, or parse and highlight line starting with ':' as Vimscript.
   if promptlen > 0 and hl_id > 0 then
@@ -64,14 +167,16 @@ local function set_text(content, prompt, hl_id)
     opts.end_line = M.erow
     api.nvim_buf_set_extmark(ui.bufs.cmd, ui.ns, M.srow, 0, opts)
   elseif lines[1]:sub(1, 1) == ':' then
-    local parser = vim.treesitter.get_string_parser(lines[1], 'vim')
+    -- Fork: the real line is what parses; its columns shift by the range label.
+    local parser = vim.treesitter.get_string_parser(real_line, 'vim')
     parser:parse(true)
     parser:for_each_tree(function(tstree, tree)
       local query = tstree and vim.treesitter.query.get(tree:lang(), 'highlights')
       if query then
-        for capture, node in query:iter_captures(tstree:root(), lines[1]) do
+        for capture, node in query:iter_captures(tstree:root(), real_line) do
           local _, start_col, _, end_col = node:range()
-          if query.captures[capture]:sub(1, 1) ~= '_' then
+          start_col, end_col = shown_col(start_col), shown_col(end_col)
+          if query.captures[capture]:sub(1, 1) ~= '_' and end_col > start_col then
             local opts = { invalidate = true, undo_restore = false, end_col = end_col }
             opts.hl_group = ('@%s.%s'):format(query.captures[capture], query.lang)
             api.nvim_buf_set_extmark(ui.bufs.cmd, ui.ns, M.srow, start_col, opts)
@@ -127,7 +232,11 @@ end
 --@param level integer
 function M.cmdline_pos(pos)
   local curpos = api.nvim_win_get_cursor(ui.wins.cmd)
-  pos = #fn.strtrans(cmdbuff:sub(1, pos))
+  if range_bytes > 0 then -- Fork: inside the range is before its label.
+    pos = pos < range_bytes and 0 or #range_label + #fn.strtrans(cmdbuff:sub(range_bytes + 1, pos))
+  else
+    pos = #fn.strtrans(cmdbuff:sub(1, pos))
+  end
   if curpos[1] ~= M.erow + 1 or curpos[2] ~= promptlen + pos then
     -- Add matchparen highlighting to non-prompt part of cmdline.
     if pos > 0 and fn.exists('#matchparen#CursorMoved') == 1 then
@@ -157,6 +266,8 @@ function M.cmdline_hide(level, abort)
     return -- No need to hide when still in nested cmdline or cmdline_block.
   end
 
+  clear_selection()
+  range_label, range_bytes = '', 0
   fn.clearmatches(ui.wins.cmd) -- Clear matchparen highlights.
   api.nvim_win_set_cursor(ui.wins.cmd, { 1, 0 })
   if M.prompt or abort then

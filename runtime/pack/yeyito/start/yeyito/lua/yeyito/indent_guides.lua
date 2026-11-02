@@ -177,9 +177,14 @@ function M.setup()
       local line = api.nvim_get_current_line()
       local key = ("%d:%s:%s"):format(api.nvim_buf_line_count(args.buf), line:match("^%s*"), line:find("%S") and 1 or 0)
       if args.event == "TextChanged" or args.event == "InsertLeave" or last[args.buf] ~= key then
-        -- Only mark it: the screen is drawn right after these events. (Without
-        -- flush = false this draws now, a frame ahead of later autocommands.)
-        api.nvim__redraw({ buf = args.buf, valid = false, flush = false })
+        -- Once the screen is drawn. Now, it would draw ahead of later autocommands
+        -- (or, with flush = false, its full redraw would replace the scroll a
+        -- deleted line makes).
+        vim.schedule(function()
+          if api.nvim_buf_is_valid(args.buf) then
+            api.nvim__redraw({ buf = args.buf, valid = false })
+          end
+        end)
       end
       last[args.buf] = key
     end,

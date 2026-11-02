@@ -225,14 +225,24 @@ function M.setup()
       git[args.buf] = nil
     end,
   })
+  -- The status line alone, once the key has done what it does: :redrawstatus
+  -- draws the whole screen right away, ahead of later autocommands and of the
+  -- rest of the key (a frame without the selection on ":" in visual mode, a text
+  -- box not yet resized). Not from a float: it has no status line.
+  local redraw_pending = false
   api.nvim_create_autocmd({ "ModeChanged", "DiagnosticChanged" }, {
     group = group,
     callback = function()
-      -- Not from a float (it has no status line): :redrawstatus draws the whole
-      -- screen now, ahead of the float's own autocommands (a text box resizing).
-      if api.nvim_win_get_config(0).relative == "" then
-        vim.cmd.redrawstatus()
+      if redraw_pending then
+        return
       end
+      redraw_pending = true
+      vim.schedule(function()
+        redraw_pending = false
+        if api.nvim_win_get_config(0).relative == "" then
+          api.nvim__redraw({ win = api.nvim_get_current_win(), statusline = true, flush = false })
+        end
+      end)
     end,
   })
 end

@@ -246,6 +246,7 @@ function M.setup()
   set_hl(0, "LineNr", { fg = c.gray, bg = c.bg })
   set_hl(0, "CursorLineNr", { fg = c.cyan, bg = c.bg, bold = true })
   set_hl(0, "CursorLine", { bg = c.cursorline })
+  set_hl(0, "YeyitoCmdRange", { fg = "#646464" }) -- "[+ 12 lines]" on the command line: Exocortex's muted
 end
 
 return M

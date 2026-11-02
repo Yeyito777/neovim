@@ -225,6 +225,68 @@ def main():
     finally:
         t.close()
 
+    # ":" in visual mode: "[+ 4 lines]" where '<,'> would be, and the lines stay
+    # highlighted, without a frame where they aren't.
+    t, layout, expr = run()
+    try:
+        expr("json_encode(setline(1, ['aa aa', 'bb bb', '', 'dd dd', 'ee ee', 'ff ff']))")
+        t.read(0.3)
+        col = expr("json_encode(getwininfo(win_getid())[0].textoff + 1)")
+
+        def attr(row):
+            return expr("json_encode(screenattr(%d, %d))" % (row, col))
+
+        def cmdline_row():
+            text = expr("json_encode(join(map(range(1, %d), {_, c -> screenstring(%d, c)}), ''))" % (COLS - 12, ROWS))
+            return text.rstrip()
+
+        def cmdline():
+            return expr("json_encode(getcmdline())")
+        plain = attr(5)
+        t.keys(b"ggVjjj", idle=0.3)
+        selected, blank = attr(2), attr(3)
+        out = t.keys(b":", idle=0.3)
+        check("visual ':': the label instead of the range", cmdline_row() == ":[+ 4 lines]" and b"'<,'>" not in out, cmdline_row())
+        check("visual ':': the command still has the range", cmdline() == "'<,'>", cmdline())
+        check("visual ':': the selected lines stay highlighted, blank ones too",
+              selected != plain and attr(2) == selected and attr(3) == blank, (selected, blank, attr(2), attr(3)))
+        check("visual ':': no frame repaints them", b"bb bb" not in out, out[-400:])
+        t.keys(b"s/b/X", idle=0.3)
+        cursor = expr("json_encode(luaeval('vim.api.nvim_win_get_cursor(require(\"vim._core.ui2\").wins.cmd)[2]'))")
+        check("visual ':': typing goes after the label, cursor included",
+              cmdline_row() == ":[+ 4 lines] s/b/X" and cursor == len(":[+ 4 lines] s/b/X"), (cmdline_row(), cursor))
+        t.keys(b"\r", idle=0.3)
+        lines = expr("json_encode(getline(1, '$'))")
+        check("visual ':': the command runs on the range", lines == ["aa aa", "Xb bb", "", "dd dd", "ee ee", "ff ff"], lines)
+        check("visual ':': the highlight goes with the command line", attr(2) != selected, attr(2))
+        t.keys(b"gg0vj$", idle=0.2)
+        t.keys(b":", idle=0.3)
+        check("visual ':': the singular is right, across lines it's plural", cmdline_row() == ":[+ 2 lines]", cmdline_row())
+        t.keys(b"\x7f", idle=0.3)
+        check("Backspace takes the label whole", cmdline_row() == ":" and cmdline() == "" and attr(2) != selected,
+              (cmdline_row(), cmdline()))
+        t.keys(b"\x7f", idle=0.3)
+        check("Backspace again leaves the command line", expr("json_encode(mode())") == "n")
+        t.keys(b"V:", idle=0.3)
+        check("visual ':': one line", cmdline_row() == ":[+ 1 line]", cmdline_row())
+        t.keys(b"\x15", idle=0.3)
+        check("Ctrl+U: the label goes", cmdline_row() == ":" and cmdline() == "", cmdline_row())
+        t.keys(b"echo 1", idle=0.3)
+        check("a plain command shows as typed", cmdline_row() == ":echo 1", cmdline_row())
+        t.keys(b"\x1b", idle=0.3)
+
+        def status():
+            return expr("json_encode(join(map(range(1, 12), {_, c -> screenstring(%d, c)}), ''))" % (ROWS - 1)).strip()
+        # The status line redraws right after the key; it still says the mode.
+        seen = [status()]
+        for key in (b"i", b"\x1b", b"V", b":", b"\x1b", b"v", b"\x1b", b"R", b"\x1b"):
+            t.keys(key, idle=0.25)
+            seen.append(status().split("│")[0].strip())
+        check("the status line follows every mode change",
+              seen[1:] == ["INSERT", "NORMAL", "V-LINE", "COMMAND", "NORMAL", "VISUAL", "NORMAL", "REPLACE", "NORMAL"], seen)
+    finally:
+        t.close()
+
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
 
