@@ -290,6 +290,7 @@ default LSP signature help there.
 
 Tests: `VIMRUNTIME=$PWD/runtime build/bin/nvim --headless -u NORC -c 'luafile
 test/yeyito/test_sidebar.lua'` (behavior and search; `$PWD` because it `cd`s) and `python3
+test/yeyito/test_sidebar_counts.py` (real Neovims: the folder numbers) and `python3
 test/yeyito/test_sidebar_layout.py` (the real TUI on a fake st: full height,
 command line and pager beside it).
 

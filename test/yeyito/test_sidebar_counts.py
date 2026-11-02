@@ -245,6 +245,17 @@ def main():
             base_tasks = len(os.listdir(f"/proc/{base.proc.pid}/task"))
             check("walks leave no threads behind", tasks <= base_tasks, (tasks, base_tasks))
 
+        # A frozen Neovim would show only after the walks: luv joins a thread by itself,
+        # so joining one too froze it a second later.
+        k = nvim()
+        k.do("S.open()")
+        wait_for(lambda: k.has("📁 src/ 6"))
+        for _ in range(3):
+            k.do('vim.cmd("doautocmd FocusGained")')
+            time.sleep(0.2)
+        time.sleep(1.5)
+        check("still answering a while after several walks", k.lua("return 1 + 1") == 2)
+
         # Quitting doesn't wait for a walk.
         worst = 0
         code = 0
