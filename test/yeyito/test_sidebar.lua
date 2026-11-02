@@ -648,8 +648,218 @@ local function order_steps()
   return steps
 end
 
+-- . files it in done/.
+local function done_steps()
+  local steps = {}
+  local function step(fn)
+    steps[#steps + 1] = fn
+  end
+  local function send(k)
+    api.nvim_feedkeys(api.nvim_replace_termcodes(k, true, false, true), "m", false)
+  end
+  local S, notices = {}, {}
+  local real_notify = vim.notify
+  local function lines()
+    return api.nvim_buf_get_lines(S.buf, 0, -1, true)
+  end
+  local function selected()
+    local row = api.nvim_win_get_cursor(S.side)[1]
+    return vim.trim(api.nvim_buf_get_lines(S.buf, row - 1, row, true)[1])
+  end
+  local function select(name)
+    api.nvim_set_current_win(S.side)
+    for i, line in ipairs(lines()) do
+      if vim.trim(line) == name then
+        api.nvim_win_set_cursor(S.side, { i, 0 })
+        return
+      end
+    end
+    error("no row " .. name .. " in " .. vim.inspect(lines()))
+  end
+  local function select_line(line)
+    api.nvim_set_current_win(S.side)
+    for i, l in ipairs(lines()) do
+      if l == line then
+        api.nvim_win_set_cursor(S.side, { i, 0 })
+        return
+      end
+    end
+    error("no line " .. line .. " in " .. vim.inspect(lines()))
+  end
+  local function exists(rel)
+    return vim.uv.fs_lstat(S.dir .. "/" .. rel) ~= nil
+  end
+  local function make(rel)
+    vim.fn.mkdir(vim.fs.dirname(S.dir .. "/" .. rel), "p")
+    vim.fn.writefile({ "x" }, S.dir .. "/" .. rel)
+  end
+
+  step(function()
+    S.dir = vim.fs.normalize(vim.fn.tempname())
+    S.trash = vim.fs.normalize(vim.fn.tempname())
+    require("yeyito.files").trash_root = S.trash
+    for _, f in ipairs({ "a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "plain/in_plain.txt", "proj/done/old.txt", "proj/inner.txt" }) do
+      make(f)
+    end
+    vim.cmd("tabnew")
+    vim.cmd.cd(S.dir)
+    vim.cmd.edit("a.txt")
+    S.editor = api.nvim_get_current_win()
+    api.nvim_buf_set_lines(0, 0, 1, false, { "unsaved" })
+    keys("<C-s>")
+    S.side, S.buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    send(":noh<CR>")
+    vim.notify = function(msg)
+      notices[#notices + 1] = msg
+    end
+  end)
+  step(function()
+    select("a.txt")
+    send(".")
+  end)
+  step(function()
+    check(".: unsaved changes refuse it, and no done/ is left behind", exists("a.txt") and not exists("done")
+      and tostring(notices[#notices]):find("unsaved", 1, true) ~= nil, notices)
+    api.nvim_win_call(S.editor, function()
+      vim.cmd("edit!")
+    end)
+    notices = {}
+    select("b.txt")
+    send(".")
+  end)
+  step(function()
+    check(".: a file goes to done/, made if it isn't there", exists("done/b.txt") and not exists("b.txt"), lines())
+    check("done/ stays closed and the row below takes the cursor", selected() == "c.txt"
+      and vim.tbl_contains(lines(), "  📁 done/"), { selected(), lines() })
+    send("u")
+  end)
+  step(function()
+    check("one u: the file back, the new done/ gone", exists("b.txt") and not exists("done"), lines())
+    select("b.txt")
+    send(".")
+  end)
+  step(function()
+    select("📁 plain/")
+    send("<CR>")
+  end)
+  step(function()
+    select("in_plain.txt")
+    send(".")
+  end)
+  step(function()
+    check("a folder without a done/: to the project's", exists("done/in_plain.txt") and not exists("plain/in_plain.txt"))
+    select("📁 proj/")
+    send("<CR>")
+  end)
+  step(function()
+    select("inner.txt")
+    send(".")
+  end)
+  step(function()
+    check("a folder with a done/ of its own: there", exists("proj/done/inner.txt") and not exists("done/inner.txt"))
+    select("📁 done/")
+    send("<CR>")
+  end)
+  step(function()
+    select("c.txt")
+    send(".")
+  end)
+  step(function()
+    check("into an open folder the cursor goes with it", exists("done/c.txt") and selected() == "c.txt"
+      and vim.startswith(lines()[api.nvim_win_get_cursor(S.side)[1]], "    "), { selected(), lines() })
+    notices = {}
+    send(".")
+  end)
+  step(function()
+    check("a file in a done folder stays, and it says so", exists("done/c.txt")
+      and notices[#notices] == "Already in a done folder", notices)
+    make("done/kept/deep.txt")
+    make("done/own/g.txt")
+    vim.fn.mkdir(S.dir .. "/done/own/done", "p")
+    make("proj/done/sub/h.txt")
+    send("R")
+  end)
+  step(function()
+    select("📁 kept/")
+    send("<CR>")
+  end)
+  step(function()
+    select("deep.txt")
+    notices = {}
+    send(".")
+  end)
+  step(function()
+    check("deeper in a done folder too", exists("done/kept/deep.txt") and notices[#notices] == "Already in a done folder", notices)
+    select("📁 own/")
+    send("<CR>")
+  end)
+  step(function()
+    select("g.txt")
+    send(".")
+  end)
+  step(function()
+    check("unless its folder keeps a done/ of its own", exists("done/own/done/g.txt") and not exists("done/own/g.txt"))
+    select("📂 kept/")
+    send(".")
+  end)
+  step(function()
+    check("a folder in done/ comes back out", exists("kept/deep.txt") and not exists("done/kept")
+      and selected() == "📂 kept/", { selected(), lines() })
+    send("u")
+  end)
+  step(function()
+    check("and u files it again", exists("done/kept/deep.txt") and not exists("kept"))
+    select_line("    📁 done/") -- proj's
+    send("<CR>")
+  end)
+  step(function()
+    select("📁 sub/")
+    send(".")
+  end)
+  step(function()
+    check("in a folder's done/: out to that folder", exists("proj/sub/h.txt") and not exists("proj/done/sub"), lines())
+    select("📂 plain/")
+    notices = {}
+    send(".")
+  end)
+  step(function()
+    check("any other folder stays", exists("plain") and not exists("done/plain") and #notices == 0, notices)
+    select_line("  d.txt")
+    send("Vj")
+  end)
+  step(function()
+    send(".")
+  end)
+  step(function()
+    check("selected rows all go", exists("done/d.txt") and exists("done/e.txt") and not exists("d.txt") and not exists("e.txt"), lines())
+    check("out of visual mode", api.nvim_get_mode().mode == "n")
+    send("u")
+  end)
+  step(function()
+    check("one u brings them back", exists("d.txt") and exists("e.txt"))
+    make("done/d.txt")
+    send("R")
+  end)
+  step(function()
+    select_line("  d.txt")
+    notices = {}
+    send(".")
+  end)
+  step(function()
+    check("the name is taken there: it says so, nothing moves", exists("d.txt")
+      and tostring(notices[#notices]):find("exists", 1, true) ~= nil, notices)
+    vim.notify = real_notify
+    require("yeyito.files").trash_root = nil
+    vim.fn.delete(S.dir, "rf")
+    vim.fn.delete(S.trash, "rf")
+    vim.cmd("tabclose")
+  end)
+  return steps
+end
+
 local steps = search_steps()
 vim.list_extend(steps, file_steps())
+vim.list_extend(steps, done_steps())
 vim.list_extend(steps, order_steps())
 local function next_step(i)
   if i > #steps then

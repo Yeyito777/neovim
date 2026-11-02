@@ -258,7 +258,11 @@ Exocortex's sidebar keys work on files too:
   duplicate (`name copy.ext`), **`F`** move into a folder of the project (Tab
   completes; empty or `/` is the top, `..` one up), **`<`** move out of its
   folder.
-- **`v`** / **`V`** select rows: `dd`, `F`, `<` and `f` (a new folder, with
+- **`.`** files it in `done/`, as in Exocortex: a file goes to its folder's own
+  `done/`, else the project's, made if it isn't there; a file already in a done
+  folder stays. A folder filed in a `done/` comes back out to that `done/`'s
+  parent; other folders stay. One `u` undoes it, the new `done/` too.
+- **`v`** / **`V`** select rows: `dd`, `F`, `<`, `.` and `f` (a new folder, with
   the selection moved into it) act on all of them.
 - **`e`** / **`E`**: move the file or folder up / down one in its folder;
   **Ctrl+E**: to its top (above folders too). With rows selected (`V`), they

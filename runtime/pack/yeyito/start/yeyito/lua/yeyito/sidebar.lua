@@ -25,7 +25,8 @@
 --            editor; Ctrl+Shift+O at the top of the project)
 --   f        new folder      r  rename      c  duplicate
 --   F        move to a folder (Tab completes)       <  move out of its folder
---   v V      select rows: d, F, f (a new folder for them) and < act on them
+--   .        file it in done/ (made if it isn't there), as in Exocortex
+--   v V      select rows: d, F, f (a new folder for them), < and . act on them
 --   e E      move up / down in its folder; Ctrl+E to its top (kept, as in Exocortex)
 --   ;        or a right click: the actions menu
 local M = {}
@@ -2370,6 +2371,131 @@ local function move_out()
   after_change(moves[1].to)
 end
 
+--- Where . files what's in `dir`: its own done/, else the project's. Nil if it's
+--- in a done folder already, unless the folder it's in keeps a done/ of its own.
+local function done_for(dir)
+  if vim.fs.basename(dir) == "done" then
+    return nil
+  end
+  local own = vim.fs.joinpath(dir, "done")
+  local stat = uv.fs_stat(own)
+  if stat and stat.type == "directory" then
+    return own
+  end
+  local up = dir
+  while #up > #root do
+    up = vim.fs.dirname(up)
+    if vim.fs.basename(up) == "done" then
+      return nil
+    end
+  end
+  return vim.fs.joinpath(root, "done")
+end
+
+--- .: the selected rows (or the cursor's), as in Exocortex: a file goes to done/
+--- (see done_for; the project's is made when it isn't there), a folder filed in a
+--- done/ comes back out to that done/'s parent. Other folders stay. When the
+--- cursor's row leaves the view the row below takes the cursor; into an open
+--- folder the cursor goes with it.
+local function to_done()
+  local win = sidebar_win()
+  local cursor = win and cursor_row(win)
+  local items = targets()
+  leave_visual()
+  clear_pending()
+  local top = vim.fs.joinpath(root, "done")
+  local moves, make_top, in_files, already = {}, false, 0, 0
+  for _, item in ipairs(items) do
+    local dir = vim.fs.dirname(item.path)
+    local name = vim.fs.basename(item.path)
+    if item.dir then
+      if #dir > #root and vim.fs.basename(dir) == "done" then
+        moves[#moves + 1] = { from = item.path, to = vim.fs.joinpath(vim.fs.dirname(dir), name) }
+      end
+    else
+      in_files = in_files + 1
+      local done = done_for(dir)
+      if done then
+        moves[#moves + 1] = { from = item.path, to = vim.fs.joinpath(done, name) }
+        make_top = make_top or (done == top and not uv.fs_lstat(top))
+      else
+        already = already + 1
+      end
+    end
+  end
+  if already > 0 then
+    vim.notify(in_files == 1 and "Already in a done folder" or already .. " already in a done folder; left in place")
+  end
+  if #moves == 0 then
+    return
+  end
+  -- A path for the cursor, in the tree as it will be.
+  local function leaving(path)
+    for _, m in ipairs(moves) do
+      if path == m.from or vim.startswith(path, m.from .. "/") then
+        return true
+      end
+    end
+    return false
+  end
+  local select = cursor and cursor.path
+  if select and leaving(select) then
+    local from = api.nvim_win_get_cursor(win)[1]
+    local to
+    for _, m in ipairs(moves) do
+      if m.from == select then
+        to = m.to
+      end
+    end
+    local dest = to and vim.fs.dirname(to)
+    if dest and (dest == root or (expanded[dest] and not leaving(dest))) then
+      select = to
+    else
+      select = nil
+      for i = from + 1, #rows do
+        if not leaving(rows[i].path) then
+          select = rows[i].path
+          break
+        end
+      end
+      for i = from - 1, 1, -1 do
+        if select then
+          break
+        end
+        if not leaving(rows[i].path) then
+          select = rows[i].path
+        end
+      end
+    end
+  end
+  if make_top then
+    local ok, err = files.create(top, true)
+    if not ok then
+      return fail(err)
+    end
+  end
+  local ok, err = files.move(moves, "move")
+  if not ok then
+    if make_top then
+      files.undo() -- nothing to keep it for
+    end
+    return fail(err)
+  end
+  if make_top then
+    files.combine(2)
+  end
+  -- A folder that was open stays open.
+  for _, m in ipairs(moves) do
+    for path in pairs(vim.deepcopy(expanded)) do
+      if path == m.from or vim.startswith(path, m.from .. "/") then
+        expanded[path] = nil
+        expanded[m.to .. path:sub(#m.from + 1)] = true
+      end
+    end
+  end
+  after_change(select)
+end
+
 --- e / E / Ctrl+E: move the selected rows (or the cursor's) up or down one
 --- among their folder's entries, or to its top, as Exocortex does; the folder
 --- keeps that order (in Neovim's state folder, across sessions).
@@ -2700,6 +2826,7 @@ local function get_buf()
     move_items(targets())
   end, "Move to a folder")
   map("<", move_out, "Move out of its folder")
+  map(".", to_done, "File in done/")
   map(";", M.open_menu, "Actions menu")
   map("e", function()
     reorder("up")
@@ -2725,6 +2852,7 @@ local function get_buf()
     move_items(items)
   end, "Move the selected rows to a folder")
   xmap("<", move_out, "Move the selected rows out of their folder")
+  xmap(".", to_done, "File the selected rows in done/")
   xmap("e", function()
     reorder("up")
   end, "Move the selected rows up (kept)")
