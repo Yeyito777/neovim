@@ -48,7 +48,7 @@ local children = {} ---@type table<string, {name: string, path: string, dir: boo
 local order_file = vim.fn.stdpath("state") .. "/sidebar-order.json"
 local order ---@type table<string, string[]>?
 -- How many files a closed folder holds (everything inside it, as Exocortex
--- counts a folder's conversations), counted in the background.
+-- counts a folder's conversations), counted in the background and kept on disk.
 local counts = {} ---@type table<string, integer>
 local count_queued = {} ---@type table<string, true>
 local rows = {} ---@type {name: string, path: string, dir: boolean, depth: integer}[]
@@ -207,6 +207,7 @@ end
 function M.moved(from, to)
   order_moved(from, to)
 end
+
 
 --- Keep the order in `path` instead (tests), read again from there.
 function M._order_file(path)
@@ -427,101 +428,355 @@ end
 -- ── File counts of closed folders ─────────────────────────────────────────
 
 local COUNT_MAX = 9999
-local count_list, counting = {}, false
+local COUNT_WALK = 3000 -- ms a walk may spend, after that the rest stays uncounted
+local COUNT_ROWS = 10000 -- folders a walk reports, the nearest the top: taking them in stays quick
+local COUNT_HUNG = 15000 -- ms before a walk stuck on a folder that doesn't answer is given up on
+local COUNT_FRESH = 60 -- s a saved count is good for when Neovim starts
+local count_job ---@type table? the walk running
+local count_list = {} ---@type string[] folders to count when it ends (what the walk of the project didn't reach)
+local count_again = false -- the project is to be walked when that's possible
+local count_next_at = 0 -- when that is (uv.hrtime() in ms): walks take about 5% of a core at most
 local count_timer ---@type uv.uv_timer_t?
+local count_off = false -- a walk hung: no more of them
+local counts_read = {} ---@type table<string, true> projects whose saved counts have been read
 local render
 
---- Count the files under the queued folders, a folder at a time, listing its
---- folders off the main thread (as the search index does); at most COUNT_MAX.
-local function next_count()
-  if counting then
-    return
-  end
-  local dir = table.remove(count_list, 1)
-  if not dir then
-    return
-  end
-  counting = true
-  local total, queue, head, busy, finished = 0, { dir }, 1, 0, false
-  local step
-  local function finish()
-    finished = true
-    counts[dir], count_queued[dir], counting = total, nil, false
-    count_timer = count_timer or uv.new_timer()
-    count_timer:stop()
-    count_timer:start(60, 0, vim.schedule_wrap(function()
-      render()
-    end))
-    vim.schedule(next_count)
-  end
-  step = function()
-    if finished then
-      return
+--- The walk, in a thread of its own (so only its arguments and vim.uv, and neither
+--- the editor nor quitting ever waits for it): the files under the folders in
+--- `dirs`, separated by NUL, or, with `cache` (a file to save the result in), under
+--- each folder of the one in `dirs`. One walk counts a folder and all those inside
+--- it, up to `cap` files, as many as a row can show. A folder that reaches it gets
+--- that, and its own folders get their turn after the ones waiting: so the time
+--- goes to the folders nearest the top, and a tree of millions of files costs what
+--- `budget` (ms) allows. Writes "count NUL path NUL" for each folder to `out`: the
+--- `max_rows` nearest the top when it's done, and, if that takes long, the top
+--- ones as they come.
+local function count_walk(out, skip, cap, budget, max_rows, cache, dirs)
+  local uv = vim.uv
+  local function send(data)
+    local sent = 0
+    while sent < #data do
+      local wrote = uv.fs_write(out, data:sub(sent + 1, sent + 65536))
+      if not wrote then
+        return
+      end
+      sent = sent + wrote
     end
-    while busy < SCANS and queue[head] and total < COUNT_MAX do
-      local d = queue[head]
-      head, busy = head + 1, busy + 1
-      local settled = false
-      local timer = uv.new_timer()
-      timer:start(SCAN_TIMEOUT, 0, function()
-        timer:close()
-        if not settled then
-          settled, busy = true, busy - 1
-          step()
+  end
+  local ok, err = pcall(function()
+    local started = uv.hrtime()
+    local deadline, sent_at = started + budget * 1e6, started
+    local levels, done, early = {}, {}, {}
+    local queue, depth_of, head = {}, {}, 1
+    local function report(dir, n, depth)
+      local row = n .. "\0" .. dir .. "\0"
+      local level = levels[depth]
+      if not level then
+        level = {}
+        levels[depth] = level
+      end
+      level[#level + 1], done[dir] = row, true
+      if depth <= 2 then
+        early[#early + 1] = row
+      end
+    end
+    local function queue_folders_of(dir, depth)
+      local handle, prefix = uv.fs_scandir(dir), dir == "/" and "/" or dir .. "/"
+      while handle do
+        local name, kind = uv.fs_scandir_next(handle)
+        if not name then
+          break
         end
-      end)
-      uv.fs_scandir(d, function(_, handle)
-        if settled then
-          return
+        local path = prefix .. name
+        if kind == "directory" and name ~= ".git" and path ~= skip and not done[path] then
+          queue[#queue + 1], depth_of[path] = path, depth
         end
-        settled, busy = true, busy - 1
-        timer:stop()
-        timer:close()
-        while handle and total < COUNT_MAX do
-          local name, kind = uv.fs_scandir_next(handle)
-          if not name then
-            break
-          end
-          if name ~= ".git" then
-            if kind == "directory" then
-              local path = d .. "/" .. name
-              if path ~= SKIP then
-                queue[#queue + 1] = path
-              end
-            else
-              total = total + 1
+      end
+    end
+    local files, entries, full
+    local function walk(dir, depth)
+      local n, handle, prefix = 0, uv.fs_scandir(dir), dir == "/" and "/" or dir .. "/"
+      while handle and not full do
+        local name, kind = uv.fs_scandir_next(handle)
+        if not name then
+          break
+        end
+        if name ~= ".git" then
+          entries = entries + 1
+          if kind == "directory" then
+            local path = prefix .. name
+            if path ~= skip then
+              n = n + walk(path, depth + 1)
             end
+          else
+            n, files = n + 1, files + 1
           end
+          full = files >= cap or entries >= cap * 4
         end
-        step()
-      end)
+      end
+      if not full then
+        report(dir, n, depth)
+      end
+      return n
     end
-    if busy == 0 and (not queue[head] or total >= COUNT_MAX) then
-      vim.schedule(function()
-        if not finished then
-          finish()
+    if cache ~= "" then
+      queue_folders_of(dirs, 1)
+    else
+      for dir in dirs:gmatch("[^%z]+") do
+        queue[#queue + 1], depth_of[dir] = dir, 1
+      end
+    end
+    while queue[head] do
+      local now = uv.hrtime()
+      if now > deadline then
+        break
+      end
+      if now - sent_at > 150e6 and early[1] then
+        send(table.concat(early))
+        early, sent_at = {}, now
+      end
+      local dir = queue[head]
+      head = head + 1
+      if not done[dir] then
+        local depth = depth_of[dir]
+        files, entries, full = 0, 0, false
+        walk(dir, depth)
+        if full then
+          report(dir, cap, depth)
+          queue_folders_of(dir, depth + 1)
         end
-      end)
+      end
     end
-  end
-  step()
+    local kept, depth = {}, 1
+    local room = max_rows
+    while levels[depth] and room > 0 do
+      local level = levels[depth]
+      kept[#kept + 1] = table.concat(level, "", 1, math.min(#level, room))
+      room = room - #level
+      depth = depth + 1
+    end
+    local data = table.concat(kept)
+    if cache ~= "" then
+      local tmp = cache .. "." .. uv.os_getpid()
+      local file = uv.fs_open(tmp, "w", 420)
+      if file then
+        uv.fs_write(file, data)
+        uv.fs_close(file)
+        uv.fs_rename(tmp, cache)
+      end
+      -- Projects not opened for a month.
+      local folder = cache:match("^(.*)/")
+      local handle = uv.fs_scandir(folder)
+      while handle do
+        local name = uv.fs_scandir_next(handle)
+        if not name then
+          break
+        end
+        local stat = uv.fs_stat(folder .. "/" .. name)
+        if stat and os.time() - stat.mtime.sec > 30 * 86400 then
+          uv.fs_unlink(folder .. "/" .. name)
+        end
+      end
+    end
+    send(data)
+  end)
+  uv.fs_close(out) -- the end of the walk for the editor
+  return ok, err
 end
 
-local function queue_count(dir)
-  if count_queued[dir] or dir == SKIP then
-    return
+local function counts_file(dir)
+  return vim.fn.stdpath("state") .. "/sidebar-counts/" .. vim.fn.sha256(dir):sub(1, 16)
+end
+
+--- Take in what a walk wrote. `changed`: gets the folders whose number is new.
+--- Returns the end of `data` that is not a whole row yet.
+local function take_counts(data, changed)
+  local from = 1
+  while true do
+    local a = data:find("\0", from, true)
+    local b = a and data:find("\0", a + 1, true)
+    if not b then
+      return data:sub(from)
+    end
+    local n, path = tonumber(data:sub(from, a - 1)), data:sub(a + 1, b - 1)
+    if counts[path] ~= n then
+      counts[path] = n
+      if changed then
+        changed[path] = true
+      end
+    end
+    from = b + 1
   end
-  count_queued[dir] = true
-  count_list[#count_list + 1] = dir
+end
+
+--- What the last walk of the project found, whichever Neovim did it.
+local function read_counts(dir)
+  if not counts_read[dir] then
+    counts_read[dir] = true
+    local file = io.open(counts_file(dir), "rb")
+    if file then
+      take_counts(file:read("*a"))
+      file:close()
+    end
+  end
+end
+
+local next_count
+
+local function count_visible()
+  for _, row in ipairs(rows) do
+    if row.dir and not row.rel and not expanded[row.path] and counts[row.path] == nil and row.path ~= SKIP
+      and not count_queued[row.path] then
+      count_queued[row.path] = true
+      count_list[#count_list + 1] = row.path
+    end
+  end
   next_count()
 end
 
---- Count the folders on show again (their numbers stay until the new ones land).
-local function recount()
-  for dir in pairs(counts) do
-    queue_count(dir)
+local function start_count(dirs, cache)
+  local fds = uv.pipe({ nonblock = true }, { nonblock = false })
+  if not fds then
+    return -- out of file descriptors: the next time
+  end
+  local reader = uv.new_pipe(false)
+  reader:open(fds.read)
+  local job, chunks, rest, changed, started = {}, {}, "", {}, uv.hrtime()
+  count_job = job
+  local hung, redraw = uv.new_timer(), uv.new_timer()
+  local redraw_set = false
+  local function show()
+    redraw:stop()
+    redraw_set = false
+    for _, row in ipairs(rows) do
+      if changed[row.path] and row.dir and not row.rel and not expanded[row.path] then
+        changed = {}
+        return render()
+      end
+    end
+  end
+  --- With the sidebar closed the numbers of the project wait in the file.
+  local function take()
+    if chunks[1] and (not cache or sidebar_win()) then
+      rest = take_counts(rest .. table.concat(chunks), changed)
+      chunks = {}
+      if next(changed) and not redraw_set then
+        redraw_set = true
+        redraw:start(100, 0, vim.schedule_wrap(function()
+          if count_job == job then
+            show()
+          end
+        end))
+      end
+    end
+  end
+  local function ended()
+    if count_job ~= job then
+      return -- given up on
+    end
+    hung:close()
+    if job.thread then
+      -- Later: a thread that found much takes a while to free it, not in the editor's time.
+      vim.defer_fn(function()
+        job.thread:join()
+      end, 1000)
+    end
+    count_job = nil
+    count_next_at = uv.hrtime() / 1e6 + math.max(100, (uv.hrtime() - started) / 1e6 * 20)
+    if cache and not sidebar_win() then
+      counts_read[dirs[1]] = nil
+    else
+      take()
+      show()
+    end
+    redraw:close()
+    if sidebar_win() then
+      count_visible()
+    else
+      next_count()
+    end
+  end
+  reader:read_start(function(_, chunk)
+    if chunk then
+      chunks[#chunks + 1] = chunk
+    else
+      reader:close()
+    end
+    vim.schedule(chunk and take or ended)
+  end)
+  hung:start(COUNT_HUNG, 0, vim.schedule_wrap(function()
+    if count_job == job then
+      count_job, count_off = nil, true
+      hung:close()
+      redraw:close()
+      if not reader:is_closing() then
+        reader:close()
+      end
+    end
+  end))
+  local ok, thread = pcall(uv.new_thread, count_walk, fds.write, SKIP or "", COUNT_MAX, COUNT_WALK, COUNT_ROWS, cache or "", table.concat(dirs, "\0"))
+  if ok and thread then
+    job.thread = thread
+  else
+    uv.fs_close(fds.write)
   end
 end
+
+next_count = function()
+  if count_job or count_off then
+    return
+  end
+  local dirs = {}
+  for _, dir in ipairs(count_list) do
+    count_queued[dir] = nil
+    if counts[dir] == nil then -- else the walk has been there
+      dirs[#dirs + 1] = dir
+    end
+  end
+  count_list = {}
+  if dirs[1] then
+    return start_count(dirs)
+  end
+  if count_again then
+    local wait = count_next_at - uv.hrtime() / 1e6
+    if wait > 0 then
+      count_timer = count_timer or uv.new_timer()
+      count_timer:stop()
+      count_timer:start(math.ceil(wait), 0, vim.schedule_wrap(next_count))
+      return
+    end
+    count_again = false
+    local dir = root or vim.fs.normalize(vim.fn.getcwd())
+    local cache = counts_file(dir)
+    vim.fn.mkdir(vim.fs.dirname(cache), "p")
+    start_count({ dir }, cache)
+  end
+end
+
+--- Walk the project again, as soon as that's reasonable: the numbers on show
+--- stay until the new ones land, and only a number that differs redraws.
+local function recount()
+  if vim.g.yeyito_sidebar_counts then
+    count_again = true
+    next_count()
+  end
+end
+
+--- Neovim is up, or in another folder: have the numbers ready for when the
+--- sidebar opens, unless that's just been done. Not for the home folder, where
+--- the sidebar is rarely wanted and macOS would ask about Desktop and the like.
+local function prefetch()
+  local dir = vim.fs.normalize(vim.fn.getcwd())
+  if dir == uv.os_homedir() or dir == "/" then
+    return
+  end
+  local stat = uv.fs_stat(counts_file(dir))
+  if not stat or os.time() - stat.mtime.sec >= COUNT_FRESH then
+    recount()
+  end
+end
+
+M._prefetch = prefetch -- for tests
 
 --- The entries in tree order: each folder's contents sorted as the tree
 --- sorts them, after the folder.
@@ -836,7 +1091,8 @@ local function printable(name)
   return not plain(name) and name:find("%c") and (name:gsub("%c", "?")) or name
 end
 
-local function label(row)
+--- `width`: for a folder too long for its row the name is cut, not the number.
+local function label(row, width)
   if row.rel then -- a search match: its path in the project
     return (row.dir and "📁 " or "") .. truncate_left(printable(row.rel) .. (row.dir and "/" or ""), WIDTH - 3 - (row.dir and 3 or 0))
   end
@@ -845,7 +1101,8 @@ local function label(row)
       return "📂 " .. printable(row.name) .. "/"
     end
     local n = vim.g.yeyito_sidebar_counts and counts[row.path]
-    return "📁 " .. printable(row.name) .. "/" .. (n and " " .. (n >= COUNT_MAX and "9999+" or n) or "")
+    local count = n and " " .. (n >= COUNT_MAX and "9999+" or n) or ""
+    return truncate("📁 " .. printable(row.name) .. "/", (width or math.huge) - #count) .. count
   end
   return printable(row.name)
 end
@@ -955,11 +1212,7 @@ function render(keep_path)
   ellipsis = vim.fn.strdisplaywidth("…")
   build()
   if vim.g.yeyito_sidebar_counts then
-    for _, row in ipairs(rows) do
-      if row.dir and not row.rel and not expanded[row.path] and counts[row.path] == nil then
-        queue_count(row.path)
-      end
-    end
+    count_visible()
   end
   local lines = {}
   local target
@@ -970,7 +1223,7 @@ function render(keep_path)
       row.line = line
     elseif not line then
       local indent = "  " .. INDENT:rep(row.depth)
-      line = indent .. truncate(label(row), WIDTH - 1 - #indent)
+      line = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
     end
     lines[i] = line
     if row.path == keep_path then
@@ -2503,6 +2756,10 @@ function M.open()
     main_win[api.nvim_get_current_tabpage()] = current
   end
   root = vim.fs.normalize(vim.fn.getcwd())
+  if vim.g.yeyito_sidebar_counts then
+    read_counts(root) -- so that the first frame has them
+    recount()
+  end
   local file = vim.fs.normalize(api.nvim_buf_get_name(0))
   local win = sidebar_win()
   if not win then
@@ -2664,6 +2921,9 @@ function M.setup()
     group = group,
     callback = function()
       refresh(true)
+      if sidebar_win() then
+        recount()
+      end
     end,
   })
   api.nvim_create_autocmd("DirChanged", {
@@ -2672,11 +2932,24 @@ function M.setup()
       if sidebar_win() then
         root = vim.fs.normalize(vim.fn.getcwd())
         expanded = {}
-        counts, count_queued, count_list = {}, {}, {}
+        if vim.g.yeyito_sidebar_counts then
+          read_counts(root)
+        end
         search.job = nil -- the next search indexes the new root
         refresh()
+      elseif vim.g.yeyito_sidebar_counts and #api.nvim_list_uis() > 0 then
+        prefetch()
       end
     end,
+  })
+  api.nvim_create_autocmd("UIEnter", {
+    group = group,
+    once = true,
+    callback = vim.schedule_wrap(function()
+      if vim.g.yeyito_sidebar_counts then
+        prefetch()
+      end
+    end),
   })
   api.nvim_create_autocmd("WinClosed", {
     group = group,

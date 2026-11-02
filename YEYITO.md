@@ -201,8 +201,17 @@ and prompts stay to its right (see [Command line and messages](#command-line-and
   rather than leaving the sidebar alone.
 - A closed folder shows how many files it holds, everything inside it, as
   Exocortex counts a folder's conversations (`📁 src/ 42`; `9999+` past
-  that). They are counted in the background; `g:yeyito_sidebar_counts =
-  v:false` turns them off.
+  that). They are there when it opens, all at once: a thread walks the
+  project when Neovim starts, unless a walk just did, and again when the
+  sidebar opens, focus comes back, a file is saved or a `:!` ends. The numbers
+  are saved (`stdpath("state")/sidebar-counts/`, one file per project, gone
+  after a month unused), so even the first frame of a new Neovim has them; a
+  new number replaces the old one without moving anything, and only a number
+  that differs redraws. In a huge tree the time goes to the folders nearest the
+  top: a folder stops counting at 9999, its folders are next, and a walk stops
+  after 3 s, so the home folder costs that, not the 7.7M files in it. The home
+  folder and `/` aren't walked at the start, only when the sidebar opens.
+  `g:yeyito_sidebar_counts = v:false` turns them off.
 
 Like Exocortex's sidebar it has its own command line, in its bottom row
 (beside the editor's):
