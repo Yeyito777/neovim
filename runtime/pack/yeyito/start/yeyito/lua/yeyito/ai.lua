@@ -9,11 +9,12 @@
 --                    about those lines); :Ai new  a fresh conversation;
 --                    :Ai log  this session's requests and replies;
 --                    :Ai clear  no more green on the lines it changed
---   Ctrl+Q           stop it while it works
+--   Ctrl+Q           stop it while it works (the next queued request then runs)
 --   Esc              in normal mode: put its reply away, then the green block
 --                    under the cursor
 -- One conversation per project (the working directory), hidden from the
--- Exocortex sidebar, kept until it has been idle an hour.
+-- Exocortex sidebar, kept until it has been idle an hour. Asking while it works
+-- queues the request for when the running one ends, as in Exocortex.
 local M = {}
 
 local api, uv = vim.api, vim.uv
@@ -35,6 +36,7 @@ local client ---@type table? the connection to the daemon
 local connecting ---@type function[]? callbacks waiting for it
 local convs = {} ---@type table<string, table> project -> conversation
 local busy = {} ---@type table<string, table> project -> the running turn
+local queue = {} ---@type table<string, table[]> project -> requests waiting for it to end
 local log = {} ---@type table<string, table[]> project -> { request, did, reply }
 local applying = false -- our own buffer changes: they keep the green tint
 local draft ---@type string? a request closed without sending, for the next box
@@ -631,7 +633,9 @@ local function draw_card()
     end, spans)
   end
   -- The lines with a space in front; `code` in a colour of its own.
-  local lines = { " " .. vim.fn.strcharpart(head, 0, width - 2) }
+  local waiting = card.kind == "working" and #(queue[card.root] or {}) or 0
+  local queued = waiting > 0 and " · " .. waiting .. " queued" or ""
+  local lines = { " " .. vim.fn.strcharpart(head, 0, width - 2 - vim.fn.strdisplaywidth(queued)) .. queued }
   for _, l in ipairs(body) do
     lines[#lines + 1] = " " .. l
   end
@@ -672,7 +676,7 @@ local function draw_card()
 end
 
 local function show_working(status)
-  card.kind, card.status, card.lines = "working", status, {}
+  card.kind, card.status = "working", status
   if not card.timer then
     card.timer = uv.new_timer()
     card.timer:start(80, 80, vim.schedule_wrap(function()
@@ -723,24 +727,62 @@ end
 
 -- ── Asking ────────────────────────────────────────────────────────────────
 
---- What the editor shows now: the file, the cursor, `sel` (the selected
---- lines: { buf, first, last, text }), for the request.
-local function editor_state(root, sel)
-  local out = {}
+--- A request, and where it was asked: its selection and the cursor stay marked in
+--- their buffers, so they are still right when it runs, after what the requests
+--- before it did to those lines and wherever the user went meanwhile. `sel`: the
+--- selected lines, { buf, first, last }.
+local function new_turn(request, sel)
+  local turn = { touched = {}, did = {}, request = request }
+  if sel and api.nvim_buf_is_valid(sel.buf) then
+    turn.tint = {
+      buf = sel.buf,
+      id = api.nvim_buf_set_extmark(sel.buf, working_ns, sel.first - 1, 0, {
+        end_row = sel.last - 1,
+        line_hl_group = "YeyitoAiWorking",
+        priority = 40,
+        right_gravity = false, -- what replaces the lines stays inside the marks
+        end_right_gravity = true,
+      }),
+    }
+  end
   local buf = api.nvim_get_current_buf()
-  local name = api.nvim_buf_get_name(buf)
-  if name ~= "" and vim.bo[buf].buftype == "" then
-    local path = vim.fs.normalize(name)
+  if api.nvim_buf_get_name(buf) ~= "" and vim.bo[buf].buftype == "" then
+    local row = api.nvim_win_get_cursor(0)[1] - 1
+    turn.asked_in = { buf = buf, id = api.nvim_buf_set_extmark(buf, working_ns, row, 0, {}) }
+  end
+  return turn
+end
+
+--- Its marks go when it has run.
+local function release(turn)
+  for _, m in ipairs({ turn.tint or false, turn.asked_in or false }) do
+    if m and api.nvim_buf_is_valid(m.buf) then
+      pcall(api.nvim_buf_del_extmark, m.buf, working_ns, m.id)
+    end
+  end
+end
+
+--- The editor as the request was asked in it, with those lines as they are now.
+local function editor_state(root, turn)
+  local out = {}
+  local here = turn.asked_in
+  local buf = here and api.nvim_buf_is_valid(here.buf) and here.buf or nil
+  local cursor = buf and api.nvim_buf_get_extmark_by_id(buf, working_ns, here.id, {})[1]
+  if cursor then
     out[#out + 1] = ("Open file: %s (cursor on line %d%s)"):format(
-      rel(root, path),
-      api.nvim_win_get_cursor(0)[1],
+      rel(root, vim.fs.normalize(api.nvim_buf_get_name(buf))),
+      cursor + 1,
       vim.bo[buf].modified and "; it has unsaved changes" or ""
     )
   end
-  if sel then
-    local path = rel(root, vim.fs.normalize(api.nvim_buf_get_name(sel.buf)))
-    local ft = vim.bo[sel.buf].filetype
-    out[#out + 1] = ("Selected: %s, lines %d-%d:\n```%s\n%s\n```"):format(path, sel.first, sel.last, ft, sel.text)
+  local tint = turn.tint
+  local mark = tint and api.nvim_buf_is_valid(tint.buf)
+    and api.nvim_buf_get_extmark_by_id(tint.buf, working_ns, tint.id, { details = true })
+  if mark and mark[1] then
+    local first, last = mark[1] + 1, math.max(mark[1], mark[3].end_row or mark[1]) + 1
+    local text = table.concat(api.nvim_buf_get_lines(tint.buf, first - 1, last, false), "\n")
+    local path = rel(root, vim.fs.normalize(api.nvim_buf_get_name(tint.buf)))
+    out[#out + 1] = ("Selected: %s, lines %d-%d:\n```%s\n%s\n```"):format(path, first, last, vim.bo[tint.buf].filetype, text)
   end
   local others = {}
   for _, b in ipairs(api.nvim_list_bufs()) do
@@ -755,43 +797,41 @@ local function editor_state(root, sel)
   return #out > 0 and "\n\n<editor>\n" .. table.concat(out, "\n") .. "\n</editor>" or ""
 end
 
---- Ask the model to do `request` in the current project; `sel` as in editor_state.
-function M.ask(request, sel)
-  request = vim.trim(request or "")
-  if request == "" then
-    return
-  end
-  local root = project()
-  if busy[root] then
-    vim.notify("The AI is still working: Ctrl+Q stops it", vim.log.levels.WARN)
-    return
-  end
-  local turn = { touched = {}, did = {}, request = request, sel = sel }
+--- Run `turn`; when it ends, however it ends, the next queued request runs (as in
+--- Exocortex). `follows`: right after another one, whose reply stays on the card.
+local function start(root, turn, follows)
   busy[root] = turn
-  if sel and api.nvim_buf_is_valid(sel.buf) then
-    turn.tint = { buf = sel.buf, id = api.nvim_buf_set_extmark(sel.buf, working_ns, sel.first - 1, 0, {
-      end_row = sel.last - 1,
-      line_hl_group = "YeyitoAiWorking",
-      priority = 40,
-    }) }
+  card.root = root
+  if not follows then
+    card.lines = {}
   end
-  local prompt = request .. (M.context and editor_state(root, sel) or "")
   show_working("thinking")
+  local prompt = turn.request .. (M.context and editor_state(root, turn) or "")
+  if M.on_prompt then
+    M.on_prompt(prompt)
+  end
   local function finish(kind, text)
     busy[root] = nil
-    if turn.tint and api.nvim_buf_is_valid(turn.tint.buf) then
-      pcall(api.nvim_buf_del_extmark, turn.tint.buf, working_ns, turn.tint.id)
+    release(turn)
+    if not turn.dropped then
+      log[root] = log[root] or {}
+      table.insert(log[root], { request = turn.request, did = turn.did, reply = text, kind = kind })
+      show_result(kind, text)
+      if M.on_done then
+        M.on_done(kind, text)
+      end
     end
-    log[root] = log[root] or {}
-    table.insert(log[root], { request = request, did = turn.did, reply = text, kind = kind })
-    show_result(kind, text)
-    if M.on_done then
-      M.on_done(kind, text)
+    local waiting = queue[root]
+    if waiting and waiting[1] then
+      start(root, table.remove(waiting, 1), not turn.dropped)
     end
   end
   local retried = false
   local function send()
     conversation(root, turn, function(err, conv)
+      if turn.dropped then
+        return finish()
+      end
       if err then
         return finish("error", err.message or tostring(err))
       end
@@ -803,6 +843,9 @@ function M.ask(request, sel)
           end
         end,
       }, function(e, result)
+        if turn.dropped then
+          return finish()
+        end
         if e then
           -- The daemon dropped it (idle too long, a reinstall): once more, in a new one.
           if not retried and (e.code == "ended" or tostring(e.message):lower():find("conversation")) then
@@ -824,6 +867,24 @@ function M.ask(request, sel)
     end)
   end
   send()
+end
+
+--- Ask the model to do `request` in the current project, now or, while it works
+--- there, when what it's doing ends. `sel`: the selected lines, { buf, first, last }.
+function M.ask(request, sel)
+  request = vim.trim(request or "")
+  if request == "" then
+    return
+  end
+  local root = project()
+  local turn = new_turn(request, sel)
+  if busy[root] then
+    queue[root] = queue[root] or {}
+    table.insert(queue[root], turn)
+    draw_card()
+    return
+  end
+  start(root, turn, false)
 end
 
 --- Ctrl+Q: stop the request running in this project. True if there was one.
@@ -866,8 +927,7 @@ local function selection(first, last)
   if vim.bo[buf].buftype ~= "" then
     return nil
   end
-  first, last = math.min(first, last), math.max(first, last)
-  return { buf = buf, first = first, last = last, text = table.concat(api.nvim_buf_get_lines(buf, first - 1, last, false), "\n") }
+  return { buf = buf, first = math.min(first, last), last = math.max(first, last) }
 end
 
 --- :Ai log: this session's requests in the project, what was done, the replies.
@@ -888,7 +948,13 @@ function M.show_log()
     vim.list_extend(lines, vim.split(t.reply, "\n", { plain = true }))
     lines[#lines + 1] = ""
   end
-  if #(log[root] or {}) == 0 then
+  local pending = vim.list_extend(busy[root] and { busy[root] } or {}, queue[root] or {})
+  for i, t in ipairs(pending) do
+    vim.list_extend(lines, { "## You (" .. (i == 1 and "running" or "queued") .. ")", "" })
+    vim.list_extend(lines, vim.split(t.request, "\n", { plain = true }))
+    lines[#lines + 1] = ""
+  end
+  if #(log[root] or {}) == 0 and #pending == 0 then
     lines[#lines + 1] = "Nothing asked in this project since Neovim started."
   end
   vim.cmd("botright vnew")
@@ -903,6 +969,13 @@ end
 --- :Ai new: forget the project's conversation; the next request starts a new one.
 function M.reset()
   local root = project()
+  for _, t in ipairs(queue[root] or {}) do
+    release(t)
+  end
+  queue[root] = nil
+  if busy[root] then
+    busy[root].dropped = true
+  end
   local conv = convs[root]
   convs[root] = nil
   write_state(root, nil)

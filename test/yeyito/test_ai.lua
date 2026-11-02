@@ -251,6 +251,105 @@ else
     return done ~= nil
   end, 10)
   check(":Ai new starts a fresh conversation", done and done.text == "turns: 1", done)
+  -- Asking while it works queues the request for when the running one ends.
+  vim.cmd("Ai new")
+  local results = {}
+  ai.on_done = function(kind, text)
+    results[#results + 1] = kind .. ": " .. text
+    done = { kind = kind, text = text }
+  end
+  local stop_key = api.nvim_replace_termcodes("<C-q>", true, false, true)
+  local function waiting_for(n)
+    return vim.wait(5000, function()
+      return #results >= n
+    end, 10)
+  end
+  ai.ask("hang")
+  vim.wait(300)
+  ai.ask("count")
+  ai.ask("count")
+  check("queued: nothing refused, nothing run yet", #results == 0, results)
+  check("queued: the card says how many", (card_lines()[1] or ""):find("2 queued", 1, true) ~= nil, card_lines())
+  vim.cmd("Ai log")
+  local pending_log = table.concat(api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  vim.cmd("close")
+  check("queued: :Ai log shows what's running and waiting", pending_log:find("## You (running)", 1, true) ~= nil
+    and select(2, pending_log:gsub("## You %(queued%)", "")) == 2, pending_log)
+  api.nvim_feedkeys(stop_key, "x", false)
+  waiting_for(3)
+  check("queued: Ctrl+Q stops the running one, the next ones run, in order",
+    vim.deep_equal(results, { "error: Stopped.", "done: turns: 2", "done: turns: 3" }), results)
+  check("queued: then the card has no count", not (card_lines()[1] or ""):find("queued", 1, true), card_lines())
+
+  results = {}
+  ai.ask("fail")
+  ai.ask("count")
+  waiting_for(2)
+  check("queued: an error doesn't stop the next one",
+    vim.deep_equal(results, { "error: fake failure", "done: turns: 5" }), results)
+
+  -- The reply stays on the card while the next one works.
+  results = {}
+  ai.ask("first")
+  ai.ask("hang")
+  vim.wait(5000, function()
+    return #results == 1 and (card_lines()[1] or ""):find("thinking", 1, true) ~= nil
+  end, 10)
+  vim.wait(100)
+  check("queued: the last reply stays on the card while the next one works",
+    (card_lines()[2] or ""):find("echo: first", 1, true) ~= nil, card_lines())
+  api.nvim_feedkeys(stop_key, "x", false)
+  waiting_for(2)
+
+  -- Where it was asked: the selection and the cursor follow their lines.
+  results = {}
+  vim.fn.writefile({ "a", "b", "c", "d", "e", "f" }, dir .. "/where.txt")
+  vim.fn.writefile({ "other" }, dir .. "/elsewhere.txt")
+  ai.ask("hang")
+  vim.wait(200)
+  vim.cmd.edit(dir .. "/where.txt")
+  local where = api.nvim_get_current_buf()
+  api.nvim_win_set_cursor(0, { 2, 0 })
+  local selected_marks = api.nvim_create_namespace("yeyito.ai.working")
+  ai.ask("count", { buf = where, first = 4, last = 5 })
+  check("queued: its selection is tinted while it waits", #vim.tbl_filter(function(m)
+    return m[4].line_hl_group == "YeyitoAiWorking"
+  end, api.nvim_buf_get_extmarks(where, selected_marks, 0, -1, { details = true })) == 1)
+  api.nvim_buf_set_lines(where, 0, 0, false, { "new 1", "new 2", "new 3" }) -- what the running one does
+  vim.cmd.edit(dir .. "/elsewhere.txt")
+  local prompts = {}
+  ai.on_prompt = function(prompt)
+    prompts[#prompts + 1] = prompt
+  end
+  ai.context = true
+  api.nvim_feedkeys(stop_key, "x", false)
+  waiting_for(2)
+  ai.context = false
+  ai.on_prompt = nil
+  local sent = prompts[1] or ""
+  check("queued: it runs with the selection where those lines are now", sent:find("lines 7-8:\n```text\nd\ne\n```", 1, true) ~= nil
+    or sent:find("lines 7-8:\n```\nd\ne\n```", 1, true) ~= nil, sent)
+  check("queued: and the file and cursor it was asked in, not where the user is now",
+    sent:find("Open file: where.txt (cursor on line 5", 1, true) ~= nil, sent)
+  check("queued: its marks go when it has run", #api.nvim_buf_get_extmarks(where, selected_marks, 0, -1, {}) == 0)
+
+  -- :Ai new drops all of it.
+  results = {}
+  ai.ask("hang")
+  vim.wait(200)
+  ai.ask("count", { buf = where, first = 1, last = 1 })
+  vim.cmd("Ai new")
+  vim.wait(400)
+  check(":Ai new: drops what's running and what's queued", #results == 0
+    and #api.nvim_buf_get_extmarks(where, selected_marks, 0, -1, {}) == 0, results)
+  ai.ask("count")
+  waiting_for(1)
+  check(":Ai new: the next request runs in a new conversation", vim.deep_equal(results, { "done: turns: 1" }), results)
+  ai.on_done = function(kind, text)
+    done = { kind = kind, text = text }
+  end
+  vim.cmd("bwipeout! " .. where)
+
   local function card_open()
     return ai._card.win ~= nil and api.nvim_win_is_valid(ai._card.win)
   end

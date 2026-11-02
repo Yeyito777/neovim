@@ -293,6 +293,12 @@ running (it says so when it isn't). No API keys here: the daemon's logins.
   left for you to save), files it makes show in the sidebar.
 - **Undo**: one `u` in a buffer undoes a request's edits there; `u` in the
   sidebar undoes the files it created, moved or deleted (to the trash).
+- Asking while it works queues the request for when the running one ends, as
+  in Exocortex (the card says `2 queued`). It keeps where you asked it: the
+  selection and the cursor follow their lines through what the requests before
+  it edit, wherever you are by then. Ctrl+Q stops only the running one, and an
+  error only fails that one: the next one then runs. `:Ai new` drops the queue;
+  so does quitting Neovim.
 - Its reply shows in the card (`code` as in Exocortex). Esc in normal mode
   puts it away; the Esc that leaves insert or visual mode, closes a box or
   menu, or cancels a sidebar `d` leaves it up.
