@@ -450,8 +450,10 @@ local render
 --- goes to the folders nearest the top, and a tree of millions of files costs what
 --- `budget` (ms) allows. Writes "count NUL path NUL" for each folder to `out`: the
 --- `max_rows` nearest the top when it's done, and, if that takes long, the top
---- ones as they come.
-local function count_walk(out, skip, cap, budget, max_rows, cache, dirs)
+--- ones as they come. Then it waits on `leave`: a thread's end signals the editor's
+--- loop, which aborts the process if that's already closed for quitting, so it
+--- ends only when the editor, alive, has said so (or with the process).
+local function count_walk(out, leave, skip, cap, budget, max_rows, cache, dirs)
   local uv = vim.uv
   local function send(data)
     local sent = 0
@@ -581,6 +583,8 @@ local function count_walk(out, skip, cap, budget, max_rows, cache, dirs)
     send(data)
   end)
   uv.fs_close(out) -- the end of the walk for the editor
+  uv.fs_read(leave, 1)
+  uv.fs_close(leave)
   return ok, err
 end
 
@@ -639,6 +643,12 @@ local function start_count(dirs, cache)
   if not fds then
     return -- out of file descriptors: the next time
   end
+  local leave = uv.pipe({ nonblock = false }, { nonblock = false })
+  if not leave then
+    uv.fs_close(fds.read)
+    uv.fs_close(fds.write)
+    return
+  end
   local reader = uv.new_pipe(false)
   reader:open(fds.read)
   local job, chunks, rest, changed, started = {}, {}, "", {}, uv.hrtime()
@@ -675,12 +685,7 @@ local function start_count(dirs, cache)
       return -- given up on
     end
     hung:close()
-    if job.thread then
-      -- Later: a thread that found much takes a while to free it, not in the editor's time.
-      vim.defer_fn(function()
-        job.thread:join()
-      end, 1000)
-    end
+    uv.fs_close(leave.write)
     count_job = nil
     count_next_at = uv.hrtime() / 1e6 + math.max(100, (uv.hrtime() - started) / 1e6 * 20)
     if cache and not sidebar_win() then
@@ -709,16 +714,20 @@ local function start_count(dirs, cache)
       count_job, count_off = nil, true
       hung:close()
       redraw:close()
+      uv.fs_close(leave.write)
       if not reader:is_closing() then
         reader:close()
       end
     end
   end))
-  local ok, thread = pcall(uv.new_thread, count_walk, fds.write, SKIP or "", COUNT_MAX, COUNT_WALK, COUNT_ROWS, cache or "", table.concat(dirs, "\0"))
+  local ok, thread = pcall(uv.new_thread, count_walk, fds.write, leave.read, SKIP or "", COUNT_MAX, COUNT_WALK, COUNT_ROWS, cache or "", table.concat(dirs, "\0"))
   if ok and thread then
-    job.thread = thread
+    -- It cleans up after itself: joined, as it would be when it ends, the editor would
+    -- wait while the thread frees all it found (65 ms in a big tree).
+    thread:detach()
   else
     uv.fs_close(fds.write)
+    uv.fs_close(leave.read)
   end
 end
 
