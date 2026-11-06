@@ -8,7 +8,9 @@
 --   :Ai [request]    the same from the command line (:ai too; with a range,
 --                    about those lines); :Ai new  a fresh conversation;
 --                    :Ai log  the conversation so far;
---                    :Ai clear  no more green on the lines it changed
+--                    :Ai clear  no more green on the lines it changed;
+--                    :Ai model opus  another model, for the folder (:Ai model
+--                    says which it is)
 --   Ctrl+Q           stop it while it works (the next queued request then runs)
 --   Esc              in normal mode: put its reply away, then the green block
 --                    under the cursor
@@ -29,6 +31,10 @@ local IDLE_TTL = 60 * 60 * 1000
 local FOLLOW_CHECK = 2000 -- how often to ask the daemon if another Neovim's request still runs
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 local READ_LIMIT = 2000 -- lines read_file returns at once
+local MODELS = vim.fn.stdpath("state") .. "/ai-models.json" -- folder -> its model, where it isn't the default
+-- What :Ai model completes: names the daemon resolves to its latest model of
+-- that kind. It takes any model id too.
+local MODEL_NAMES = { "opus", "sonnet", "haiku", "fable", "sol", "astra", "terra", "luna" }
 
 local changed_ns = api.nvim_create_namespace("yeyito.ai.changed")
 local working_ns = api.nvim_create_namespace("yeyito.ai.working")
@@ -41,6 +47,7 @@ local convs = {} ---@type table<string, table> project -> conversation
 local busy = {} ---@type table<string, table> project -> the running turn
 local foreign = {} ---@type table<string, table> project -> another Neovim's running turn
 local queue = {} ---@type table<string, table[]> project -> requests waiting for it to end
+local pending_model = {} ---@type table<string, string> project -> a model asked for while a request ran
 local applying = false -- our own buffer changes: they keep the green tint
 local draft ---@type string? a request closed without sending, for the next box
 
@@ -413,6 +420,32 @@ end
 
 -- ── Conversation ──────────────────────────────────────────────────────────
 
+local function read_models()
+  local f = io.open(MODELS, "r")
+  if not f then
+    return {}
+  end
+  local ok, data = pcall(vim.json.decode, f:read("*a"))
+  f:close()
+  return ok and type(data) == "table" and data or {}
+end
+
+--- The model new conversations in `root` start with.
+local function folder_model(root)
+  return read_models()[root] or vim.g.yeyito_ai_model
+end
+
+local function save_folder_model(root, model)
+  local data = read_models()
+  data[root] = model ~= vim.g.yeyito_ai_model and model or nil
+  vim.fn.mkdir(vim.fs.dirname(MODELS), "p")
+  local f = io.open(MODELS, "w")
+  if f then
+    f:write(vim.json.encode(data))
+    f:close()
+  end
+end
+
 local on_daemon_event
 
 local function with_client(cb)
@@ -500,7 +533,7 @@ local function conversation(root, turn, cb)
       idle_ttl_ms = IDLE_TTL,
       title = "Neovim · " .. vim.fs.basename(root),
       system = { base = "none", text = system_prompt(root) },
-      model = vim.g.yeyito_ai_model,
+      model = folder_model(root),
       cwd = root,
       builtin = { "bash", "glob", "grep" },
       tools = defs,
@@ -515,7 +548,7 @@ end
 
 -- ── The card: what it's doing, then its reply (top right of the editor) ───
 
-local card = { win = nil, buf = nil, timer = nil, frame = 1, status = "", lines = {}, kind = "working" }
+local card = { win = nil, buf = nil, timer = nil, frame = 1, status = "", lines = {}, kind = "working", model = nil }
 
 local function close_card()
   if card.timer then
@@ -529,9 +562,20 @@ local function close_card()
   card.win = nil
 end
 
-local function model_label()
-  local name, major, minor = (vim.g.yeyito_ai_model or ""):match("^claude%-(%a+)%-(%d+)%-(%d+)")
-  return name and (name:sub(1, 1):upper() .. name:sub(2) .. " " .. major .. "." .. minor) or vim.g.yeyito_ai_model
+--- "Opus 5.5" for claude-opus-5-5, "Opus" for opus, else the id.
+local function model_label(model)
+  model = model or vim.g.yeyito_ai_model or ""
+  local name, major, minor = model:match("^claude%-(%a+)%-(%d+)%-(%d+)")
+  if name then
+    return name:sub(1, 1):upper() .. name:sub(2) .. " " .. major .. "." .. minor
+  end
+  return model:match("^%a+$") and model:sub(1, 1):upper() .. model:sub(2) or model
+end
+
+--- The model of the project's conversation, as last heard.
+local function current_model(root)
+  local conv = convs[root]
+  return conv and not conv.ended and conv.info and conv.info.model or folder_model(root)
 end
 
 --- `text` laid out in lines of at most `width` columns, broken at spaces;
@@ -627,11 +671,11 @@ local function draw_card()
   local width = math.max(30, math.min(64, math.floor(vim.o.columns * 0.4)))
   local head
   if card.kind == "working" then
-    head = SPINNER[card.frame] .. " " .. model_label() .. " · " .. card.status
+    head = SPINNER[card.frame] .. " " .. model_label(card.model) .. " · " .. card.status
   elseif card.kind == "error" then
-    head = "✗ " .. model_label()
+    head = "✗ " .. model_label(card.model)
   else
-    head = "✓ " .. model_label()
+    head = "✓ " .. model_label(card.model)
   end
   local body, spans = {}, {}
   for _, text in ipairs(card.lines) do
@@ -819,7 +863,7 @@ local pump
 --- Exocortex). `follows`: right after another one, whose reply stays on the card.
 local function start(root, turn, follows)
   busy[root] = turn
-  card.root = root
+  card.root, card.model = root, current_model(root)
   if not follows then
     card.lines = {}
   end
@@ -849,6 +893,7 @@ local function start(root, turn, follows)
         return finish("error", err.message or tostring(err))
       end
       turn.conv = conv
+      card.model = current_model(root)
       conv:send(prompt, {
         on_event = function(ev)
           if ev.type == "tool_call" and busy[root] == turn then
@@ -889,12 +934,57 @@ local function start(root, turn, follows)
   send()
 end
 
+--- Switch `conv` to model `name`. cb(err, model): the id the daemon made of it.
+local function set_model(conv, name, cb)
+  client:request({ type = "set_model", convId = conv.id, model = name }, function(ev)
+    return ev.type == "ack"
+  end, function(e)
+    if e then
+      return cb(e)
+    end
+    client:list({}, function(_, list)
+      local model = name
+      for _, info in ipairs(list or {}) do
+        if info.convId == conv.id then
+          model = info.model
+        end
+      end
+      conv.info.model = model
+      cb(nil, model)
+    end)
+  end)
+end
+
+local function refused_while_streaming(e)
+  return tostring(e and e.message):find("streaming", 1, true) ~= nil
+end
+
+--- A model asked for while a request ran: switched to once the conversation is free.
+local function apply_pending_model(root, cb)
+  local name, conv = pending_model[root], convs[root]
+  if not (name and conv and not conv.ended and client and not busy[root] and not foreign[root]) then
+    return cb()
+  end
+  set_model(conv, name, function(e, model)
+    if not e then
+      pending_model[root] = nil
+      save_folder_model(root, model)
+    elseif not refused_while_streaming(e) then -- else another Neovim's started: after it
+      pending_model[root] = nil
+      vim.notify("AI: " .. tostring(e.message), vim.log.levels.ERROR)
+    end
+    cb()
+  end)
+end
+
 --- The next waiting request runs, if the conversation is free.
 pump = function(root, follows)
-  local waiting = queue[root]
-  if waiting and waiting[1] and not busy[root] and not foreign[root] then
-    start(root, table.remove(waiting, 1), follows)
-  end
+  apply_pending_model(root, function()
+    local waiting = queue[root]
+    if waiting and waiting[1] and not busy[root] and not foreign[root] then
+      start(root, table.remove(waiting, 1), follows)
+    end
+  end)
 end
 
 -- ── The other Neovims in the folder ───────────────────────────────────────
@@ -1023,7 +1113,7 @@ following = function(root)
   local turn = { touched = {}, calls = {}, held = {} }
   foreign[root] = turn
   if root == project() then
-    card.root, card.lines = root, {}
+    card.root, card.lines, card.model = root, {}, current_model(root)
     show_working("thinking")
   end
   -- Its end can pass unseen (the connection dropped): the daemon knows.
@@ -1097,7 +1187,15 @@ local function daemon_event(ev)
     elseif foreign[root] then
       foreign_ended(root)
     end
-  elseif busy[root] then
+    return
+  end
+  if t == "streaming_started" and ev.model then
+    convs[root].info.model = ev.model -- another Neovim may have switched it
+    if card.root == root then
+      card.model = ev.model
+    end
+  end
+  if busy[root] then
     return -- this Neovim's own: start() has it
   elseif t == "streaming_started" or t == "user_message" or t == "turn_catchup" then
     following(root)
@@ -1244,7 +1342,7 @@ local function log_lines(root, entries)
         lines[#lines + 1] = ""
       end
       if #reply > 0 then
-        vim.list_extend(lines, { "## " .. model_label(), "" })
+        vim.list_extend(lines, { "## " .. model_label(entry.metadata and entry.metadata.model or current_model(root)), "" })
         add(table.concat(reply, "\n\n"))
       end
     end
@@ -1289,6 +1387,78 @@ function M.show_log()
     end)
   end)
 end
+local function valid_model(name)
+  return vim.tbl_contains(MODEL_NAMES, name) or (name:find("%d") and name:match("^[%w._/-]+$")) ~= nil
+end
+
+--- :Ai model: which model the project's conversation is on.
+function M.show_model()
+  local root = project()
+  with_client(function(err, c)
+    if err then
+      return vim.notify(model_label(folder_model(root)))
+    end
+    c:list({}, function(_, list)
+      local model = folder_model(root)
+      for _, info in ipairs(list or {}) do
+        if info.cwd == root then
+          model = info.model
+          break
+        end
+      end
+      local next_one = pending_model[root]
+      vim.notify(model_label(model) .. (next_one and ", " .. model_label(next_one) .. " from the next request" or ""))
+    end)
+  end)
+end
+
+--- :Ai model NAME: the project's conversation goes on with another model, in every
+--- Neovim there, and the ones started there later begin with it. While a request
+--- runs, from the next one.
+function M.set_model(name)
+  local root = project()
+  if not valid_model(name) then
+    return vim.notify("No model " .. name .. ": " .. table.concat(MODEL_NAMES, ", ") .. " or a model id", vim.log.levels.ERROR)
+  end
+  local function fail(e)
+    vim.notify("AI: " .. tostring(e.message or e), vim.log.levels.ERROR)
+  end
+  local function later()
+    pending_model[root] = name
+    vim.notify(model_label(name) .. " from the next request")
+  end
+  local function switch(conv)
+    if busy[root] or foreign[root] then
+      return later()
+    end
+    set_model(conv, name, function(e, model)
+      if e then
+        return refused_while_streaming(e) and later() or fail(e)
+      end
+      pending_model[root] = nil
+      save_folder_model(root, model)
+      if card.root == root and card.kind ~= "working" then
+        card.model = model
+      end
+      vim.notify(model_label(model))
+    end)
+  end
+  find(root, function(err, conv)
+    if err then
+      return fail(err)
+    end
+    if conv then
+      return switch(conv)
+    end
+    conversation(root, { touched = {}, did = {} }, function(e, new)
+      if e then
+        return fail(e)
+      end
+      switch(new)
+    end)
+  end)
+end
+
 --- :Ai new: end the project's conversation, in every Neovim there; the next
 --- request starts a new one.
 function M.reset()
@@ -1390,6 +1560,12 @@ function M.setup()
       return M.show_log()
     elseif o.args == "clear" then
       return M.clear_changes()
+    elseif o.args == "model" then
+      return M.show_model()
+    end
+    local model = o.args:match("^model%s+(%S+)$") -- more words: a request about a model
+    if model then
+      return M.set_model(model)
     end
     local sel = o.range > 0 and selection(o.line1, o.line2) or nil
     if o.args == "" then
@@ -1399,11 +1575,13 @@ function M.setup()
   end, {
     nargs = "*",
     range = true,
-    desc = "Ask the AI (Exocortex): :Ai request, :Ai new, :Ai log, :Ai clear",
-    complete = function(lead)
+    desc = "Ask the AI (Exocortex): :Ai request, :Ai new, :Ai log, :Ai clear, :Ai model [name]",
+    complete = function(lead, line)
+      local args = line:match("Ai%s+(.*)$") or ""
+      local words = args:match("^model%s+%S*$") and MODEL_NAMES or not args:find("%s") and { "new", "log", "clear", "model" } or {}
       return vim.tbl_filter(function(c)
         return vim.startswith(c, lead)
-      end, { "new", "log", "clear" })
+      end, words)
     end,
   })
   -- :ai works too.

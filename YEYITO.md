@@ -305,6 +305,12 @@ command line and pager beside it).
 The model (Sonnet 5.5; `g:yeyito_ai_model` picks another) works on the
 project through Neovim, on your Exocortex daemon: it needs `exocortexd`
 running (it says so when it isn't). No API keys here: the daemon's logins.
+**`:Ai model opus`** (or `sonnet`, `haiku`, `fable`, `sol`, any model id; Tab
+completes) switches the folder's conversation, so every Neovim there, and the
+folder keeps it for the conversations after (`ai-models.json` in Neovim's state
+folder; `:Ai model sonnet` back to the default forgets it). While a request runs
+it takes effect from the next one. **`:Ai model`** says which it is. `:Ai model`
+with more words after it is a request.
 
 - **`<leader>a`**: a box in the middle of the editor; type the request,
   Enter. In visual mode, about the selected lines (the title says how many).

@@ -353,6 +353,70 @@ else
   end
   vim.cmd("bwipeout! " .. where)
 
+  -- :Ai model: the folder's model, for its conversation and the next ones there.
+  local notices = {}
+  local real_notify = vim.notify
+  vim.notify = function(msg)
+    notices[#notices + 1] = msg
+  end
+  local function ask_model()
+    done = nil
+    ai.ask("model")
+    vim.wait(5000, function()
+      return done ~= nil
+    end, 10)
+    return done and done.text
+  end
+  local function last_notice()
+    vim.wait(3000, function()
+      return #notices > 0
+    end, 10)
+    return table.remove(notices)
+  end
+  check(":Ai model: the default to start with", ask_model() == "model: claude-sonnet-5-5", done)
+  vim.cmd("Ai model")
+  check(":Ai model says which", last_notice() == "Sonnet 5.5", notices)
+  vim.cmd("Ai model opus")
+  check(":Ai model opus: said", last_notice() == "Opus 5.5", notices)
+  check("the next request runs on it", ask_model() == "model: claude-opus-5-5", done)
+  check("and the card says so", (card_lines()[1] or ""):find("Opus 5.5", 1, true) ~= nil, card_lines())
+  local saved = vim.json.decode(table.concat(vim.fn.readfile(vim.fn.stdpath("state") .. "/ai-models.json"), ""))
+  check("kept for the folder", saved[vim.fs.normalize(vim.fn.getcwd())] == "claude-opus-5-5", saved)
+  vim.cmd("Ai new")
+  notices = {}
+  check("a new conversation in the folder starts with it", ask_model() == "model: claude-opus-5-5", done)
+  ai.ask("hang")
+  vim.wait(300)
+  vim.cmd("Ai model haiku")
+  check("while it works: from the next request", last_notice() == "Haiku from the next request", notices)
+  ai.ask("model")
+  results = {}
+  ai.on_done = function(kind, text)
+    results[#results + 1] = kind .. ": " .. text
+    done = { kind = kind, text = text }
+  end
+  api.nvim_feedkeys(stop_key, "x", false)
+  waiting_for(2)
+  check("then the next request runs on it", results[2] == "done: model: claude-haiku-5-5", results)
+  saved = vim.json.decode(table.concat(vim.fn.readfile(vim.fn.stdpath("state") .. "/ai-models.json"), ""))
+  check("and that's kept", saved[vim.fs.normalize(vim.fn.getcwd())] == "claude-haiku-5-5", saved)
+  vim.cmd("Ai model nope")
+  check("no such model: said, nothing changes", tostring(last_notice()):find("No model nope", 1, true) ~= nil
+    and ask_model() == "model: claude-haiku-5-5", done)
+  vim.cmd("Ai model sonnet")
+  last_notice()
+  saved = vim.json.decode(table.concat(vim.fn.readfile(vim.fn.stdpath("state") .. "/ai-models.json"), ""))
+  check("back to the default: the folder forgets it", saved[vim.fs.normalize(vim.fn.getcwd())] == nil, saved)
+  done = nil
+  vim.cmd("Ai model the data as a dataclass")
+  vim.wait(5000, function()
+    return done ~= nil
+  end, 10)
+  check("more words: a request", done and done.text == "model: claude-sonnet-5-5", done)
+  check(":Ai model <Tab> completes the names", vim.deep_equal(vim.fn.getcompletion("Ai model o", "cmdline"), { "opus" })
+    and vim.tbl_contains(vim.fn.getcompletion("Ai m", "cmdline"), "model"), vim.fn.getcompletion("Ai model o", "cmdline"))
+  vim.notify = real_notify
+
   local function card_open()
     return ai._card.win ~= nil and api.nvim_win_is_valid(ai._card.win)
   end

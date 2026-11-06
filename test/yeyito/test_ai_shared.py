@@ -352,6 +352,27 @@ def main():
         o.ask("count")
         wait_for(lambda: o.lua("done[1]"))
         check("and has its own conversation", o.lua("done[1]") == "done: turns: 1", o.lua("done"))
+
+        # :Ai model is the folder's: every Neovim there.
+        a.do("done = {}")
+        b.do("done = {}")
+        a.do('vim.cmd("Ai model opus")')
+        time.sleep(0.3)
+        b.ask("model")
+        check(":Ai model in one: the other's request runs on it", wait_for(lambda: b.lua("done[1]") == "done: model: claude-opus-5-5"), b.lua("done"))
+        check("and both cards say so", wait_for(lambda: a.card_says("Opus 5.5")) and b.card_says("Opus 5.5"), (a.card(), b.card()))
+        b.do("done = {}")
+        b.ask("hang")
+        wait_for(lambda: a.card_says("thinking"))
+        a.do('vim.cmd("Ai model haiku")')
+        time.sleep(0.2)
+        b.lua("ai.stop()")
+        wait_for(lambda: b.lua("done[1]"))
+        b.do("done = {}")
+        time.sleep(0.3)
+        b.ask("model")
+        check("asked for while another's request ran: switched when it ended", wait_for(lambda: b.lua("done[1]") == "done: model: claude-haiku-5-5"), b.lua("done"))
+        a.do('vim.cmd("Ai model sonnet")')
     finally:
         for n in all_nvims:
             n.quit()
