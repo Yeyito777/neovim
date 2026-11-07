@@ -79,7 +79,7 @@ local search = {
 local bar ---@type table?
 -- The strip below the sidebar's list (its status line and the command line
 -- rows), so the sidebar runs to the bottom of the screen.
-local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer? }
+local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer?, shown_as: string? }
 local foot_ns = api.nvim_create_namespace("yeyito.sidebar.foot")
 local match_ns = api.nvim_create_namespace("yeyito.sidebar.match")
 -- dd: the rows waiting for the second d ({ key, paths }), shown red.
@@ -649,7 +649,7 @@ end
 local next_count
 
 local function count_visible()
-  for _, row in ipairs(rows) do
+  for _, row in ipairs(rows[1] and rows[1].rel and {} or rows) do -- a search's matches have no numbers
     if row.dir and not row.rel and not expanded[row.path] and counts[row.path] == nil and row.path ~= SKIP
       and not count_queued[row.path] then
       count_queued[row.path] = true
@@ -873,6 +873,29 @@ local function emit(dir, kids, check, old)
   return list, by_path
 end
 
+--- The index's lowercased names (or project-relative paths with `path`) in
+--- one string, and where each entry's starts in it: a plain find in C goes
+--- through 50,000 names in a fraction of a millisecond, a find per entry
+--- takes several (20 on the Mac).
+local function haystack(index, path, check)
+  local field = path and "rel_hay" or "name_hay"
+  local hay = index[field]
+  if not hay then
+    local parts, starts, at = {}, {}, 1
+    for i, e in ipairs(index) do
+      local s = path and e.rel:lower() or e.lname
+      parts[i], starts[i] = s, at
+      at = at + #s + 1
+      if check then
+        check()
+      end
+    end
+    hay = { text = table.concat(parts, "\n"), starts = starts }
+    index[field] = hay
+  end
+  return hay
+end
+
 --- Build the index of the root anew in the background (unless that is
 --- already happening); `index_ready` runs when it lands.
 local function start_index()
@@ -894,7 +917,9 @@ local function start_index()
     if git_out then
       from_git(git_out, kids, check)
     end
-    return emit(job.root, kids, check, old)
+    local list, by_path = emit(job.root, kids, check, old)
+    haystack(list, false, check) -- for the first letter typed
+    return list, by_path
   end)
   local function resume(git_out)
     if search.job ~= job then
@@ -934,26 +959,6 @@ end
 --- The index of the root, if one has been built.
 local function current_index()
   return search.index_root == root and search.index or nil
-end
-
---- The index's lowercased names (or project-relative paths with `path`) in
---- one string, and where each entry's starts in it: a plain find in C goes
---- through 50,000 names in a fraction of a millisecond, a find per entry
---- takes several (20 on the Mac).
-local function haystack(index, path)
-  local field = path and "rel_hay" or "name_hay"
-  local hay = index[field]
-  if not hay then
-    local parts, starts, at = {}, {}, 1
-    for i, e in ipairs(index) do
-      local s = path and e.rel:lower() or e.lname
-      parts[i], starts[i] = s, at
-      at = at + #s + 1
-    end
-    hay = { text = table.concat(parts, "\n"), starts = starts }
-    index[field] = hay
-  end
-  return hay
 end
 
 --- Entries matching `query`: case-insensitive, in the name, or in the
@@ -1005,6 +1010,24 @@ end
 local function next_match(list, from, direction)
   if #list == 0 then
     return nil
+  end
+  -- From an entry of the index: by its place, the list being in that order.
+  local at = from and list[1].order and search.by_path and search.by_path[from.path]
+  if at then
+    local lo, hi = 1, #list + 1 -- the first match after it
+    while lo < hi do
+      local mid = math.floor((lo + hi) / 2)
+      if list[mid].order > at.order then
+        hi = mid
+      else
+        lo = mid + 1
+      end
+    end
+    if direction == "forward" then
+      return list[lo] or list[1]
+    end
+    local i = list[lo - 1] == at and lo - 2 or lo - 1
+    return list[i] or list[#list]
   end
   if direction == "forward" then
     for _, e in ipairs(list) do
@@ -1236,9 +1259,19 @@ local function draw_current()
   api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   local win = editor_win()
   local current = win and vim.fs.normalize(api.nvim_buf_get_name(api.nvim_win_get_buf(win))) or ""
+  local function bold(i)
+    api.nvim_buf_set_extmark(buf, ns, i - 1, 0, { end_col = #api.nvim_buf_get_lines(buf, i - 1, i, true)[1], hl_group = "YeyitoSidebarCurrent" })
+  end
+  if rows.at then -- a search's matches: by its place
+    local i = rows.at[current]
+    if i and not rows[i].dir then
+      bold(i)
+    end
+    return
+  end
   for i, row in ipairs(rows) do
     if not row.dir and row.path == current then
-      api.nvim_buf_set_extmark(buf, ns, i - 1, 0, { end_col = #api.nvim_buf_get_lines(buf, i - 1, i, true)[1], hl_group = "YeyitoSidebarCurrent" })
+      bold(i)
     end
   end
 end
@@ -1297,17 +1330,25 @@ function render(keep_path)
   end
   local lines = {}
   local target
-  for i, row in ipairs(rows) do
-    local line = row.line -- a search match keeps its line: the index doesn't change under it
-    if row.rel and (not line or row.line_e ~= ellipsis) then
-      line = search_line(row)
-    elseif not line then
-      local indent = "  " .. INDENT:rep(row.depth)
-      line = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
+  if rows[1] and rows[1].rel then
+    -- A search's matches: their lines and places are kept with the list,
+    -- for the next key (n, N, a backspace) and the next render.
+    if rows.lines_e ~= ellipsis then
+      local at = {}
+      for i, row in ipairs(rows) do
+        lines[i] = row.line_e == ellipsis and row.line or search_line(row)
+        at[row.path] = i
+      end
+      rows.lines, rows.at, rows.lines_e = lines, at, ellipsis
     end
-    lines[i] = line
-    if row.path == keep_path then
-      target = i
+    lines, target = rows.lines, keep_path and rows.at[keep_path]
+  else
+    for i, row in ipairs(rows) do
+      local indent = "  " .. INDENT:rep(row.depth)
+      lines[i] = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
+      if row.path == keep_path then
+        target = i
+      end
     end
   end
   local query = active_query()
@@ -1317,7 +1358,7 @@ function render(keep_path)
   -- The same rows (n in a search, a number that didn't change): the
   -- buffer stays, and so does the screen.
   local same = shown.buf == buf and #shown.lines == #lines
-  for i = 1, same and #lines or 0 do
+  for i = 1, same and shown.lines ~= lines and #lines or 0 do
     if lines[i] ~= shown.lines[i] then
       same = false
       break
@@ -1489,6 +1530,14 @@ local function update_foot()
     close_foot()
     return
   end
+  local filter = search.filter and search.query ~= "" and not bar
+  local border = focused() and "YeyitoSidebarBorderFocused" or "YeyitoSidebarBorder"
+  local shown_as = table.concat({ top, height, border, filter and search.direction .. search.query or "" }, "\0")
+  if foot.win and api.nvim_win_is_valid(foot.win) and api.nvim_win_get_tabpage(foot.win) == api.nvim_get_current_tabpage()
+    and foot.shown_as == shown_as then
+    return -- as it is (Tab, n, each render)
+  end
+  foot.shown_as = shown_as
   if not (foot.buf and api.nvim_buf_is_valid(foot.buf)) then
     foot.buf = api.nvim_create_buf(false, true)
     vim.bo[foot.buf].bufhidden = "hide"
@@ -1499,14 +1548,13 @@ local function update_foot()
   end
   -- The last search stays on show while the list is filtered, like the
   -- editor's command line shows it.
-  if search.filter and search.query ~= "" and not bar then
+  if filter then
     local text = " " .. (search.direction == "forward" and "/" or "?") .. search.query
     text = truncate(text, WIDTH - 2)
     lines[height] = text .. (" "):rep(WIDTH - 1 - vim.fn.strdisplaywidth(text)) .. "│"
   end
   api.nvim_buf_set_lines(foot.buf, 0, -1, false, lines)
   api.nvim_buf_clear_namespace(foot.buf, foot_ns, 0, -1)
-  local border = focused() and "YeyitoSidebarBorderFocused" or "YeyitoSidebarBorder"
   for i, line in ipairs(lines) do
     api.nvim_buf_set_extmark(foot.buf, foot_ns, i - 1, #line - #"│", { end_col = #line, hl_group = border })
   end
