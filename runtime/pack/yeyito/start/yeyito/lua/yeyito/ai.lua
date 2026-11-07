@@ -725,8 +725,15 @@ local function draw_card()
     height = #lines,
   }
   if card.win and api.nvim_win_is_valid(card.win) then
-    api.nvim_win_set_config(card.win, cfg)
+    -- Only when it moved or changed size: setting it redraws the whole card,
+    -- border too, and the spinner redraws the card every 80 ms.
+    local key = cfg.col .. "," .. cfg.width .. "," .. cfg.height
+    if card.cfg ~= key then
+      api.nvim_win_set_config(card.win, cfg)
+      card.cfg = key
+    end
   else
+    card.cfg = cfg.col .. "," .. cfg.width .. "," .. cfg.height
     cfg.style, cfg.focusable, cfg.mouse, cfg.zindex, cfg.noautocmd = "minimal", false, false, 150, true
     cfg.border = { "┌", "─", "┐", "│", "┘", "─", "└", "│" }
     card.win = api.nvim_open_win(card.buf, false, cfg)
