@@ -20,6 +20,28 @@ local end_reg = vim.regex([[^\s*\(}\|]\|)\|end\)]])
 
 -- indent-blankline's indent.get(): one entry per leading-whitespace column.
 -- `state.stack` holds the widths of the enclosing (open) indents.
+local byte = string.byte
+
+-- The length of `line`'s leading whitespace (what "^%s*" matches; a byte
+-- loop, since patterns with classes aren't compiled by LuaJIT).
+local function leading(line)
+  local n = 0
+  while true do
+    local b = byte(line, n + 1)
+    if not b or not (b == 32 or (b >= 9 and b <= 13)) then
+      return n
+    end
+    n = n + 1
+  end
+end
+
+local function contains(list, x)
+  for i = 1, #list do
+    if list[i] == x then return true end
+  end
+  return false
+end
+
 local function classify(ws, sw, ts, state)
   local tbl = {}
   local spaces, tabs, extra, since_tab = 0, 0, 0, 0
@@ -28,8 +50,8 @@ local function classify(ws, sw, ts, state)
     cap = state.stack[1] or 0
     state.cap = false
   end
-  for ch in ws:gmatch(".") do
-    if ch == "\t" then
+  for i = 1, #ws do
+    if byte(ws, i) == 9 then
       local width = ts - ((since_tab + extra - ts) % ts)
       tabs = tabs + width
       tbl[#tbl + 1] = TAB
@@ -39,7 +61,7 @@ local function classify(ws, sw, ts, state)
       since_tab = 0
     else
       local mod = (spaces + tabs + extra) % sw
-      if vim.list_contains(state.stack, spaces + tabs) then
+      if contains(state.stack, spaces + tabs) then
         tbl[#tbl + 1] = INDENT
         extra = extra + mod
       elseif mod == 0 then
@@ -61,11 +83,18 @@ local function classify(ws, sw, ts, state)
 end
 
 local function push(state, width, whitespace_only)
-  state.stack = vim.tbl_filter(function(w)
-    return w < width
-  end, state.stack)
+  local stack, n = state.stack, 0
+  for i = 1, #stack do
+    if stack[i] < width then
+      n = n + 1
+      stack[n] = stack[i]
+    end
+  end
+  for i = #stack, n + 1, -1 do
+    stack[i] = nil
+  end
   if not whitespace_only then
-    state.stack[#state.stack + 1] = width
+    stack[n + 1] = width
   end
 end
 
@@ -85,7 +114,7 @@ local function compute(win, buf, toprow, botrow)
   local stop = math.min(last, botrow + 100)
   local all = api.nvim_buf_get_lines(buf, first, stop + 1, false)
   local s = toprow - first + 1
-  while s > 1 and not (all[s] and all[s] ~= "" and not all[s]:find("^%s")) do
+  while s > 1 and not (all[s] and all[s] ~= "" and leading(all[s]) == 0) do
     s = s - 1
   end
   local start = first + s - 1
@@ -97,7 +126,7 @@ local function compute(win, buf, toprow, botrow)
     local line = lines[i]
     local tbl
     if line ~= "" then
-      local ws = line:match("^%s+") or ""
+      local ws = line:sub(1, leading(line))
       local width
       tbl, width = classify(ws, sw, ts, state)
       push(state, width, ws == line)
@@ -113,7 +142,7 @@ local function compute(win, buf, toprow, botrow)
         blanks_left = blanks_left + 1
         j = j + 1
       end
-      local ws = lines[j]:match("^%s+") or ""
+      local ws = lines[j]:sub(1, leading(lines[j]))
       local width
       tbl, width = classify(ws, sw, ts, state)
       push(state, width, false)
@@ -154,6 +183,7 @@ local function compute(win, buf, toprow, botrow)
 end
 
 local drawing = {} ---@type table<integer, table<integer, table>>
+local drawn_key = {} ---@type table<integer, string> what `drawing` was computed for
 
 -- Edits ({row, old_rows, new_rows}) since the guides were last checked, per
 -- buffer followed; false: followed, none.
@@ -263,7 +293,14 @@ function M.setup()
       if edits[buf] then
         edits[buf] = false -- drawn with them (another buffer's edits get no TextChanged)
       end
-      drawing[win] = compute(win, buf, toprow, botrow)
+      -- The guides only depend on the text and the view: a cursor move draws
+      -- the same ones again.
+      local key = ("%d:%d:%d:%d:%d:%d"):format(buf, api.nvim_buf_get_changedtick(buf), toprow, botrow,
+        api.nvim_win_call(win, vim.fn.winsaveview).leftcol, vim.bo[buf].tabstop * 1000 + vim.bo[buf].shiftwidth)
+      if drawn_key[win] ~= key then
+        drawn_key[win] = key
+        drawing[win] = compute(win, buf, toprow, botrow)
+      end
     end,
     on_line = function(_, win, buf, row)
       local vt = drawing[win] and drawing[win][row]
