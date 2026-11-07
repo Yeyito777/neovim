@@ -1404,14 +1404,14 @@ function refresh(soon)
   end))
 end
 
---- Expand the folders down to `path` and select it.
+--- Expand the folders down to `path` and select it. Returns whether it drew.
 local function reveal(path)
   if active_query() then
     render(path)
-    return
+    return true
   end
   if not (root and path and path ~= "" and vim.startswith(path, root .. "/")) then
-    return
+    return false
   end
   local dir = vim.fs.dirname(path)
   while dir and dir ~= root and #dir > #root do
@@ -1419,6 +1419,7 @@ local function reveal(path)
     dir = vim.fs.dirname(dir)
   end
   render(path)
+  return true
 end
 
 function M.reveal(path)
@@ -1643,12 +1644,14 @@ index_ready = function()
   end
 end
 
+local NOH = { noh = true, nohl = true, nohlsearch = true }
+
 local function run_command(cmd)
   cmd = vim.trim(cmd)
   if cmd == "" then
     return
   end
-  if cmd == "noh" or cmd == "nohl" or cmd == "nohlsearch" then
+  if NOH[cmd] then
     local sel = selected_entry()
     search.filter = false
     if sel then
@@ -1683,6 +1686,9 @@ local function submit_bar()
   local input = api.nvim_buf_get_lines(b.buf, 0, 1, false)[1] or ""
   if b.mode == "command" then
     close_bar(false)
+    if NOH[vim.trim(input)] then
+      return run_command(input) -- the sidebar's own: in the same frame as the bar closing
+    end
     -- After the bar's insert mode has ended: leaving it clears the command
     -- line, which would take the command's messages with it.
     vim.schedule(function()
@@ -3068,8 +3074,9 @@ function M.open()
     api.nvim_set_current_win(win)
   end
   children = {}
-  render()
-  reveal(file)
+  if not reveal(file) then
+    render()
+  end
   update_foot()
 end
 
