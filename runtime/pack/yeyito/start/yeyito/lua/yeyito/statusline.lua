@@ -77,8 +77,9 @@ local function highlights()
 end
 
 -- Git branch and diff counts per buffer, refreshed on enter/write/focus.
-local git = {} ---@type table<integer, { branch: string, diff: string }>
+local git = {} ---@type table<integer, { branch: string, diff: string, name: string, root: string?, stamp: string? }>
 
+-- The branch, and the repository's git directory (a worktree has its own).
 local function read_branch(root)
   local gitdir = root .. "/.git"
   if vim.fn.filereadable(gitdir) == 1 then -- worktree: "gitdir: <path>"
@@ -96,7 +97,17 @@ local function read_branch(root)
   if not head then
     return ""
   end
-  return head:match("^ref: refs/heads/(.+)$") or head:match("^ref: (.+)$") or head:sub(1, 7)
+  return head:match("^ref: refs/heads/(.+)$") or head:match("^ref: (.+)$") or head:sub(1, 7), gitdir
+end
+
+-- What `git diff` of the file depends on: the file and git's index.
+local function stamp(file, gitdir)
+  local parts = {}
+  for _, path in ipairs({ file, gitdir .. "/index" }) do
+    local st = vim.uv.fs_stat(path)
+    parts[#parts + 1] = st and ("%d.%d:%d"):format(st.mtime.sec, st.mtime.nsec, st.size) or "-"
+  end
+  return table.concat(parts, " ")
 end
 
 -- Count hunks like lualine: paired old/new lines are "modified".
@@ -123,23 +134,35 @@ end
 
 local function update_git(buf)
   local file = api.nvim_buf_get_name(buf)
-  local root = file ~= "" and vim.bo[buf].buftype == "" and vim.fs.root(file, ".git")
-  if not root then
-    git[buf] = nil
+  local entry = git[buf]
+  if not entry or entry.name ~= file then
+    entry = { branch = "", diff = "", name = file }
+    entry.root = file ~= "" and vim.bo[buf].buftype == "" and vim.fs.root(file, ".git") or nil
+    git[buf] = entry
+  end
+  if not entry.root then
     return
   end
-  local entry = git[buf] or { diff = "" }
-  entry.branch = read_branch(root)
-  git[buf] = entry
-  if vim.uv.fs_stat(file) then
-    local cmd = { "git", "-C", vim.fs.dirname(file), "--no-pager", "diff", "--no-color", "--no-ext-diff", "-U0", "--", file }
-    pcall(vim.system, cmd, { text = true }, function(res)
-      entry.diff = res.code == 0 and parse_diff(res.stdout or "") or ""
-      vim.schedule(function()
-        vim.cmd.redrawstatus({ bang = true })
-      end)
-    end)
+  local gitdir
+  entry.branch, gitdir = read_branch(entry.root)
+  if not gitdir or not vim.uv.fs_stat(file) then
+    entry.diff, entry.stamp = "", nil
+    return
   end
+  -- Starting git costs the editor ~3 ms (more on macOS): only when the
+  -- file or the index changed since the last diff.
+  local now = stamp(file, gitdir)
+  if now == entry.stamp then
+    return
+  end
+  entry.stamp = now
+  local cmd = { "git", "-C", vim.fs.dirname(file), "--no-pager", "diff", "--no-color", "--no-ext-diff", "-U0", "--", file }
+  pcall(vim.system, cmd, { text = true }, function(res)
+    entry.diff = res.code == 0 and parse_diff(res.stdout or "") or ""
+    vim.schedule(function()
+      vim.cmd.redrawstatus({ bang = true })
+    end)
+  end)
 end
 
 local function diagnostics(buf)
@@ -191,7 +214,7 @@ function M.render()
   local name = mode_names[api.nvim_get_mode().mode] or api.nvim_get_mode().mode
   local kind = mode_kinds[name] or "normal"
   local info = git[buf]
-  local branch = info and info.branch ~= "" and (" \u{e0a0} " .. info.branch .. " ") or ""
+  local branch = info and info.branch and info.branch ~= "" and (" \u{e0a0} " .. info.branch .. " ") or ""
   local diff = info and info.diff or ""
   local b = branch .. ((branch ~= "" and diff ~= "") and "│" or "")
 
