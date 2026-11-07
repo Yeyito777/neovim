@@ -476,8 +476,39 @@ end
 
 --- @private
 --- @param injections_by_lang table<string, Range6[][]>
-function LanguageTree:_add_injections(injections_by_lang)
+--- @param scanned? Range[] The rows scanned for them, if not the whole source.
+function LanguageTree:_add_injections(injections_by_lang, scanned)
   local seen_langs = {} ---@type table<string,boolean>
+
+  if scanned then
+    -- A partial scan: the injections outside it are still there. Keep those
+    -- already parsed, rather than drop them all (a window scrolling, or the
+    -- highlighter parsing a single row, would have every other region parsed
+    -- again from nothing).
+    for lang, child in pairs(self._children) do
+      local kept = {} ---@type Range6[][]
+      for i, region in pairs(child:included_regions()) do
+        local outside = child._trees[i] ~= nil and child._valid_regions[i] and #region > 0
+        for _, r in ipairs(scanned) do
+          local srow, _, erow = Range.unpack4(r)
+          if region[1][1] <= erow and region[#region][4] >= srow then
+            outside = false
+            break
+          end
+        end
+        if outside then
+          kept[#kept + 1] = region
+        end
+      end
+      if #kept > 0 then
+        local regions = vim.list_extend(injections_by_lang[lang] or {}, kept)
+        table.sort(regions, function(a, b)
+          return a[1][3] < b[1][3]
+        end)
+        injections_by_lang[lang] = regions
+      end
+    end
+  end
 
   for lang, injection_regions in pairs(injections_by_lang) do
     local has_lang = pcall(language.add, lang)
@@ -687,8 +718,8 @@ function LanguageTree:_parse(range, thread_state)
       )
     )
   then
-    local injections_by_lang = self:_get_injections(range, thread_state)
-    local time = tcall(self._add_injections, self, injections_by_lang)
+    local injections_by_lang, scanned = self:_get_injections(range, thread_state)
+    local time = tcall(self._add_injections, self, injections_by_lang, scanned)
     self:_subtract_time(thread_state, time)
   end
 
@@ -861,12 +892,42 @@ function LanguageTree:set_included_regions(new_regions)
   -- invalidated. For example, if included_regions = new_regions ++ hole ++ outdated_regions, then
   -- outdated_regions is invalidated by _iter_regions in else branch.
   if #self:included_regions() ~= #new_regions then
-    -- TODO(lewis6991): inefficient; invalidate trees incrementally
-    for _, t in pairs(self._trees) do
+    -- Keep the trees of the regions that are still there: a partial parse of
+    -- another range (a window scrolled) has most of the same regions.
+    local function key(region)
+      local parts = {}
+      for _, range in ipairs(region) do
+        parts[#parts + 1] = table.concat(range, ',')
+      end
+      return table.concat(parts, ';')
+    end
+    local old = {} ---@type table<string, integer>
+    for i, region in pairs(self:included_regions()) do
+      if self._trees[i] then
+        old[key(region)] = i
+      end
+    end
+    local trees, valid, num_valid = {}, {}, 0 ---@type table<integer, TSTree>, table<integer, true>, integer
+    for i, region in ipairs(new_regions) do
+      local k = key(region)
+      local j = old[k]
+      if j then
+        old[k] = nil
+        trees[i] = self._trees[j]
+        if self._valid_regions[j] then
+          valid[i] = true
+          num_valid = num_valid + 1
+        end
+      end
+    end
+    for _, j in pairs(old) do
+      local t = self._trees[j]
       self:_do_callback('changedtree', t:included_ranges(true), t)
     end
-    self._trees = {}
     self:invalidate()
+    self._trees = trees
+    self._valid_regions = valid
+    self._num_valid_regions = num_valid
   else
     self:_iter_regions(function(i, region)
       return vim.deep_equal(new_regions[i], region)
@@ -1143,7 +1204,7 @@ function LanguageTree:_get_injections(range, thread_state)
     self._processed_injection_region = range
   end
 
-  return result
+  return result, not full_scan and range or nil
 end
 
 ---@private
