@@ -226,6 +226,30 @@ function M.cmdline_special_char(c, shift)
   end)
 end
 
+-- Fork: matchparen runs only when it has something to do: on a character of
+-- 'matchpairs', or to clear what it highlighted before. Running it on every key
+-- was a third of what a key costs on the cmdline.
+local matched = false -- matchparen last ran on a character of 'matchpairs'
+
+--- Whether the character that ends at byte `col` (0-based, exclusive) of the
+--- cmdline row is one of 'matchpairs'.
+---
+---@param col integer
+---@return boolean
+local function on_pair(col)
+  local line = api.nvim_buf_get_lines(ui.bufs.cmd, M.erow, M.erow + 1, false)[1] or ''
+  if col < 1 or col > #line then
+    return false
+  end
+  local char = line:sub(col + vim.str_utf_start(line, col), col)
+  for pair in vim.gsplit(vim.o.matchpairs, ',', { plain = true }) do
+    if vim.startswith(pair, char .. ':') or vim.endswith(pair, ':' .. char) then
+      return true
+    end
+  end
+  return false
+end
+
 --- Set the cmdline cursor position.
 ---
 ---@param pos integer
@@ -239,8 +263,10 @@ function M.cmdline_pos(pos)
   end
   if curpos[1] ~= M.erow + 1 or curpos[2] ~= promptlen + pos then
     -- Add matchparen highlighting to non-prompt part of cmdline.
-    if pos > 0 and fn.exists('#matchparen#CursorMoved') == 1 then
-      api.nvim_win_set_cursor(ui.wins.cmd, { M.erow + 1, promptlen + pos - 1 })
+    local pair = pos > 0 and on_pair(promptlen + pos)
+    if (pair or matched) and fn.exists('#matchparen#CursorMoved') == 1 then
+      matched = pair
+      api.nvim_win_set_cursor(ui.wins.cmd, { M.erow + 1, math.max(promptlen + pos - 1, 0) })
       vim._with({ win = ui.wins.cmd, wo = { eventignorewin = '' } }, function()
         api.nvim_exec_autocmds('CursorMoved', {})
       end)
@@ -269,6 +295,7 @@ function M.cmdline_hide(level, abort)
   clear_selection()
   range_label, range_bytes = '', 0
   fn.clearmatches(ui.wins.cmd) -- Clear matchparen highlights.
+  matched = false
   api.nvim_win_set_cursor(ui.wins.cmd, { 1, 0 })
   if M.prompt or abort then
     -- Clear cmd buffer prompt or aborted command (non-abort is left visible).

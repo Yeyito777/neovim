@@ -157,6 +157,25 @@ def main():
     finally:
         t.close()
 
+    # matchparen pairs brackets on the command line, and lets go of them (it only
+    # runs on a bracket, or to clear one).
+    t, layout, expr = run()
+    try:
+        pairs = lambda: expr("json_encode(len(filter(getmatches(luaeval('require(\"vim._core.ui2\").wins.cmd')), 'v:val.group ==# \"MatchParen\"')))")
+        t.keys(b":echo (a")
+        before = pairs()
+        t.keys(b")")
+        on = pairs()
+        t.keys(b" x")
+        off = pairs()
+        t.keys(b"\x1b[D\x1b[D")
+        back = pairs()
+        check("cmdline: matchparen pairs a bracket, lets go after it, pairs it again",
+              before == 0 and on > 0 and off == 0 and back > 0, (before, on, off, back))
+        t.keys(b"\x1b")
+    finally:
+        t.close()
+
     # The AI's request box changes layout in the same screen update as the text:
     # one frame per key (no ruler: ui2 draws it in a frame of its own), and the
     # text never scrolls out of view, not even when a row fills up exactly and
