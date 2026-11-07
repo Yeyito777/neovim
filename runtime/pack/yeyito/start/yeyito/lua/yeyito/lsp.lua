@@ -65,14 +65,34 @@ local function on_attach(args)
 end
 
 function M.setup()
-  for name, conf in pairs(servers) do
-    vim.lsp.config(name, require("yeyito.servers." .. name))
-    vim.lsp.config(name, conf)
+  local group = vim.api.nvim_create_augroup("yeyito.lsp", { clear = true })
+  -- vim.lsp takes a while to load (12-18 ms on the Mac), so it loads with the
+  -- first file one of the servers is for, not with Neovim. Scheduled, out of
+  -- that FileType event; then the servers start for the buffers already
+  -- open, that one included.
+  local defs, filetypes = {}, {}
+  for name in pairs(servers) do
+    defs[name] = require("yeyito.servers." .. name)
+    vim.list_extend(filetypes, defs[name].filetypes or {})
   end
-  vim.lsp.enable(vim.tbl_keys(servers))
+  vim.api.nvim_create_autocmd("FileType", {
+    group = group,
+    pattern = filetypes,
+    once = true,
+    callback = vim.schedule_wrap(function()
+      for name, conf in pairs(servers) do
+        vim.lsp.config(name, defs[name])
+        vim.lsp.config(name, conf)
+      end
+      vim.lsp.enable(vim.tbl_keys(servers))
+      if vim.v.vim_did_enter == 0 then -- enable() leaves the open buffers to VimEnter's
+        vim.cmd.doautoall("nvim.lsp.enable FileType")
+      end
+    end),
+  })
 
   vim.api.nvim_create_autocmd("LspAttach", {
-    group = vim.api.nvim_create_augroup("yeyito.lsp", { clear = true }),
+    group = group,
     callback = on_attach,
   })
 

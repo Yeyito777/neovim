@@ -29,6 +29,7 @@
 #include "nvim/globals.h"
 #include "nvim/lua/treesitter.h"
 #include "nvim/macros_defs.h"
+#include "nvim/main.h"
 #include "nvim/map_defs.h"
 #include "nvim/memline.h"
 #include "nvim/memory.h"
@@ -60,9 +61,27 @@ typedef struct {
   uint64_t timeout_threshold_ns;
 } TSLuaParserCallbackPayload;
 
+// A query compiled on libuv's thread pool ahead of its first use
+// (vim._ts_precompile_query), for vim._ts_parse_query to take. Compiling a
+// big grammar's query takes tree-sitter a while (C++ highlights: 160 ms).
+typedef struct {
+  uv_work_t req;
+  uv_mutex_t mutex;
+  uv_cond_t cond;
+  const TSLanguage *lang;
+  char *src;
+  size_t len;
+  TSQuery *query;  ///< NULL once compiled: an invalid query (compiled again for its error)
+  bool compiled;  ///< set on the pool's thread, under the mutex
+  bool after;  ///< the loop has run its after-work callback
+  bool taken;  ///< vim._ts_parse_query has it
+} TSLuaQueryJob;
+
 #include "lua/treesitter.c.generated.h"
 
 static PMap(cstr_t) langs = MAP_INIT;
+/// Precompiled queries by language name, a newline and the source.
+static PMap(cstr_t) query_jobs = MAP_INIT;
 
 #ifdef HAVE_WASMTIME
 static wasm_engine_t *wasmengine;
@@ -1541,6 +1560,113 @@ static struct luaL_Reg query_meta[] = {
   { NULL, NULL }
 };
 
+/// The key of a query in query_jobs: the language's name, a newline, the
+/// source (a C string: a source with a NUL in it isn't precompiled).
+static String query_job_key(const char *lang_name, const char *src, size_t len)
+{
+  size_t name_len = strlen(lang_name);
+  String key = { .data = xmalloc(name_len + 1 + len + 1), .size = name_len + 1 + len };
+  memcpy(key.data, lang_name, name_len);
+  key.data[name_len] = '\n';
+  memcpy(key.data + name_len + 1, src, len);
+  key.data[key.size] = NUL;
+  return key;
+}
+
+static void query_job_free(TSLuaQueryJob *job)
+{
+  uv_mutex_destroy(&job->mutex);
+  uv_cond_destroy(&job->cond);
+  xfree(job->src);
+  xfree(job);
+}
+
+/// On the pool's thread: ts_query_new only reads the language.
+static void query_job_work(uv_work_t *req)
+{
+  TSLuaQueryJob *job = req->data;
+  uint32_t error_offset;
+  TSQueryError error_type;
+  TSQuery *query = ts_query_new(job->lang, job->src, (uint32_t)job->len, &error_offset, &error_type);
+  uv_mutex_lock(&job->mutex);
+  job->query = query;
+  job->compiled = true;
+  uv_cond_signal(&job->cond);
+  uv_mutex_unlock(&job->mutex);
+}
+
+static void query_job_after(uv_work_t *req, int status)
+{
+  (void)status;
+  TSLuaQueryJob *job = req->data;
+  job->after = true;
+  if (job->taken) {
+    query_job_free(job);
+  }
+}
+
+/// vim._ts_precompile_query(lang, source): start compiling the query that
+/// vim._ts_parse_query(lang, source) will want, in the background.
+static int tslua_precompile_query(lua_State *L)
+{
+  if (lua_gettop(L) < 2 || !lua_isstring(L, 1) || !lua_isstring(L, 2)) {
+    return luaL_error(L, "string expected");
+  }
+  TSLanguage *lang = lang_check(L, 1);
+  size_t len;
+  const char *src = lua_tolstring(L, 2, &len);
+  if (memchr(src, NUL, len)) {
+    return 0;
+  }
+  String key = query_job_key(lua_tostring(L, 1), src, len);
+  if (map_has(cstr_t, &query_jobs, key.data)) {
+    xfree(key.data);
+    return 0;
+  }
+  TSLuaQueryJob *job = xcalloc(1, sizeof(*job));
+  job->lang = lang;
+  job->src = xmemdupz(src, len);
+  job->len = len;
+  job->req.data = job;
+  uv_mutex_init(&job->mutex);
+  uv_cond_init(&job->cond);
+  if (uv_queue_work(&main_loop.uv, &job->req, query_job_work, query_job_after) != 0) {
+    query_job_free(job);
+    xfree(key.data);
+    return 0;
+  }
+  pmap_put(cstr_t)(&query_jobs, key.data, job);
+  return 0;
+}
+
+/// The precompiled query for this source, waiting for it if it isn't done yet.
+/// NULL when there is none or it doesn't compile.
+static TSQuery *query_job_take(const char *lang_name, const char *src, size_t len)
+{
+  if (!map_size(&query_jobs) || memchr(src, NUL, len)) {
+    return NULL;
+  }
+  String key = query_job_key(lang_name, src, len);
+  cstr_t stored = NULL;
+  TSLuaQueryJob *job = pmap_del(cstr_t)(&query_jobs, key.data, &stored);
+  xfree(key.data);
+  if (!job) {
+    return NULL;
+  }
+  xfree((void *)stored);
+  uv_mutex_lock(&job->mutex);
+  while (!job->compiled) {
+    uv_cond_wait(&job->cond, &job->mutex);
+  }
+  uv_mutex_unlock(&job->mutex);
+  TSQuery *query = job->query;
+  job->taken = true;
+  if (job->after) {
+    query_job_free(job);
+  }
+  return query;
+}
+
 static int tslua_parse_query(lua_State *L)
 {
   if (lua_gettop(L) < 2 || !lua_isstring(L, 1) || !lua_isstring(L, 2)) {
@@ -1555,7 +1681,10 @@ static int tslua_parse_query(lua_State *L)
   tslua_query_parse_count++;
   uint32_t error_offset;
   TSQueryError error_type;
-  TSQuery *query = ts_query_new(lang, src, (uint32_t)len, &error_offset, &error_type);
+  TSQuery *query = query_job_take(lua_tostring(L, 1), src, len);
+  if (!query) {
+    query = ts_query_new(lang, src, (uint32_t)len, &error_offset, &error_type);
+  }
 
   if (!query) {
     char err_msg[IOSIZE];
@@ -1835,6 +1964,9 @@ void nlua_treesitter_init(lua_State *const lstate) FUNC_ATTR_NONNULL_ALL
 
   lua_pushcfunction(lstate, tslua_parse_query);
   lua_setfield(lstate, -2, "_ts_parse_query");
+
+  lua_pushcfunction(lstate, tslua_precompile_query);
+  lua_setfield(lstate, -2, "_ts_precompile_query");
 
   lua_pushcfunction(lstate, tslua_get_language_version);
   lua_setfield(lstate, -2, "_ts_get_language_version");
