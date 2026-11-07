@@ -979,7 +979,7 @@ local function matches(query)
   if out then
     return out -- typed before: a backspace
   end
-  local hay = haystack(index, query:find("/", 1, true))
+  local hay = haystack(index, query:find("/", 1, true) ~= nil)
   local text, starts, last = hay.text, hay.starts, #index
   local lq = query:lower()
   out = {}
