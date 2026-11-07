@@ -42,6 +42,16 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
   185 ms, injections 177 ms): `treesitter.lua` has a language's highlights
   and indents compile there while the parser's injections compile, on its
   first file.
+- **One frame per normal-mode key** (C, `normal.c`): 'showcmd' no longer
+  flushes the typed key onto the screen before the command runs, a frame of
+  its own for every key. Keys still waiting for more (`d`, `"a`, a count)
+  show anyway: getting the next key flushes first.
+- **Partial parses keep injections** (Lua, `runtime/lua/vim/treesitter/languagetree.lua`):
+  parsing part of a buffer kept only the injected regions found in that
+  part, and a different number of regions dropped every tree, so in
+  Markdown (a region per paragraph) each scroll step reparsed the whole
+  view. Regions outside the part parsed, and regions that are still there,
+  now keep their trees.
 - **Bundled parsers**: python cpp java bash javascript typescript tsx html css
   rust, besides upstream's c lua vim vimdoc query markdown
   (`cmake.deps/deps.txt`, pinned to nvim-treesitter's lockfile).

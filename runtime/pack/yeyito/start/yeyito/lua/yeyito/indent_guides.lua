@@ -20,6 +20,28 @@ local end_reg = vim.regex([[^\s*\(}\|]\|)\|end\)]])
 
 -- indent-blankline's indent.get(): one entry per leading-whitespace column.
 -- `state.stack` holds the widths of the enclosing (open) indents.
+local byte = string.byte
+
+-- The length of `line`'s leading whitespace (what "^%s*" matches; a byte
+-- loop, since patterns with classes aren't compiled by LuaJIT).
+local function leading(line)
+  local n = 0
+  while true do
+    local b = byte(line, n + 1)
+    if not b or not (b == 32 or (b >= 9 and b <= 13)) then
+      return n
+    end
+    n = n + 1
+  end
+end
+
+local function contains(list, x)
+  for i = 1, #list do
+    if list[i] == x then return true end
+  end
+  return false
+end
+
 local function classify(ws, sw, ts, state)
   local tbl = {}
   local spaces, tabs, extra, since_tab = 0, 0, 0, 0
@@ -28,8 +50,8 @@ local function classify(ws, sw, ts, state)
     cap = state.stack[1] or 0
     state.cap = false
   end
-  for ch in ws:gmatch(".") do
-    if ch == "\t" then
+  for i = 1, #ws do
+    if byte(ws, i) == 9 then
       local width = ts - ((since_tab + extra - ts) % ts)
       tabs = tabs + width
       tbl[#tbl + 1] = TAB
@@ -39,7 +61,7 @@ local function classify(ws, sw, ts, state)
       since_tab = 0
     else
       local mod = (spaces + tabs + extra) % sw
-      if vim.list_contains(state.stack, spaces + tabs) then
+      if contains(state.stack, spaces + tabs) then
         tbl[#tbl + 1] = INDENT
         extra = extra + mod
       elseif mod == 0 then
@@ -61,11 +83,18 @@ local function classify(ws, sw, ts, state)
 end
 
 local function push(state, width, whitespace_only)
-  state.stack = vim.tbl_filter(function(w)
-    return w < width
-  end, state.stack)
+  local stack, n = state.stack, 0
+  for i = 1, #stack do
+    if stack[i] < width then
+      n = n + 1
+      stack[n] = stack[i]
+    end
+  end
+  for i = #stack, n + 1, -1 do
+    stack[i] = nil
+  end
   if not whitespace_only then
-    state.stack[#state.stack + 1] = width
+    stack[n + 1] = width
   end
 end
 
@@ -85,7 +114,7 @@ local function compute(win, buf, toprow, botrow)
   local stop = math.min(last, botrow + 100)
   local all = api.nvim_buf_get_lines(buf, first, stop + 1, false)
   local s = toprow - first + 1
-  while s > 1 and not (all[s] and all[s] ~= "" and not all[s]:find("^%s")) do
+  while s > 1 and not (all[s] and all[s] ~= "" and leading(all[s]) == 0) do
     s = s - 1
   end
   local start = first + s - 1
@@ -97,7 +126,7 @@ local function compute(win, buf, toprow, botrow)
     local line = lines[i]
     local tbl
     if line ~= "" then
-      local ws = line:match("^%s+") or ""
+      local ws = line:sub(1, leading(line))
       local width
       tbl, width = classify(ws, sw, ts, state)
       push(state, width, ws == line)
@@ -113,7 +142,7 @@ local function compute(win, buf, toprow, botrow)
         blanks_left = blanks_left + 1
         j = j + 1
       end
-      local ws = lines[j]:match("^%s+") or ""
+      local ws = lines[j]:sub(1, leading(lines[j]))
       local width
       tbl, width = classify(ws, sw, ts, state)
       push(state, width, false)
@@ -154,6 +183,61 @@ local function compute(win, buf, toprow, botrow)
 end
 
 local drawing = {} ---@type table<integer, table<integer, table>>
+local drawn_key = {} ---@type table<integer, string> what `drawing` was computed for
+
+-- Edits ({row, old_rows, new_rows}) since the guides were last checked, per
+-- buffer followed; false: followed, none.
+local edits = {} ---@type table<integer, table[]|false>
+
+local function follow(buf)
+  if edits[buf] ~= nil then return end
+  edits[buf] = false
+  api.nvim_buf_attach(buf, false, {
+    on_bytes = function(_, b, _, row, _, _, old_rows, _, _, new_rows)
+      if edits[b] == nil then return true end
+      edits[b] = edits[b] or {}
+      table.insert(edits[b], { row, old_rows, new_rows })
+    end,
+    on_detach = function(_, b) edits[b] = nil end,
+  })
+end
+
+local function same(a, b)
+  if a == nil or b == nil then return a == b end
+  if #a ~= #b then return false end
+  for i = 1, #a do
+    if a[i][1] ~= b[i][1] then return false end
+  end
+  return true
+end
+
+-- The rows (first, last) of `win` whose guides the edits changed besides the
+-- lines they changed, which are drawn again anyway.
+local function stale_rows(win, buf, changes)
+  local old = drawing[win]
+  if not old then return end
+  for _, e in ipairs(changes) do
+    local row, old_rows, new_rows = e[1], e[2], e[3]
+    local moved = {}
+    for r, vt in pairs(old) do
+      if r < row then
+        moved[r] = vt
+      elseif r > row + old_rows then
+        moved[r + new_rows - old_rows] = vt
+      end
+    end
+    old = moved
+  end
+  local top, bot = vim.fn.line("w0", win) - 1, vim.fn.line("w$", win) - 1
+  local now = compute(win, buf, top, bot)
+  local first, last
+  for r = top, bot do
+    if not same(now[r], old[r]) then
+      first, last = first or r, r
+    end
+  end
+  return first, last
+end
 
 function M.setup()
   local colors = require("yeyito.colors")
@@ -165,28 +249,38 @@ function M.setup()
   api.nvim_create_autocmd("ColorScheme", { group = group, callback = highlights })
 
   -- A line's guides depend on the lines around it, but Neovim only redraws
-  -- the lines that changed: redraw the window when indentation may have
-  -- shifted (line count, or the edited line's indent or blankness changed).
-  local last = {} ---@type table<integer, string>
-  api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP", "InsertLeave" }, {
+  -- the lines that changed: before the screen is drawn, work out which other
+  -- lines' guides an edit changed and have those drawn too, in the same
+  -- frame. (Redrawing the window once it was drawn was a second frame per
+  -- change, and a whole window drawn again.)
+  api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = group,
     callback = function(args)
-      if exclude_ft[vim.bo[args.buf].filetype] or exclude_bt[vim.bo[args.buf].buftype] then
+      local buf = args.buf
+      if exclude_ft[vim.bo[buf].filetype] or exclude_bt[vim.bo[buf].buftype] then
         return
       end
-      local line = api.nvim_get_current_line()
-      local key = ("%d:%s:%s"):format(api.nvim_buf_line_count(args.buf), line:match("^%s*"), line:find("%S") and 1 or 0)
-      if args.event == "TextChanged" or args.event == "InsertLeave" or last[args.buf] ~= key then
-        -- Once the screen is drawn. Now, it would draw ahead of later autocommands
-        -- (or, with flush = false, its full redraw would replace the scroll a
-        -- deleted line makes).
+      local changes = edits[buf]
+      if changes == false then return end
+      if changes == nil then
+        -- Not followed yet: what changed is unknown.
+        follow(buf)
         vim.schedule(function()
-          if api.nvim_buf_is_valid(args.buf) then
-            api.nvim__redraw({ buf = args.buf, valid = false })
+          if api.nvim_buf_is_valid(buf) then
+            api.nvim__redraw({ buf = buf, valid = false })
           end
         end)
+        return
       end
-      last[args.buf] = key
+      edits[buf] = false
+      for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+        if api.nvim_win_get_buf(win) == buf then
+          local first, last = stale_rows(win, buf, changes)
+          if first then
+            api.nvim__redraw({ win = win, range = { first, last + 1 }, flush = false })
+          end
+        end
+      end
     end,
   })
 
@@ -195,7 +289,18 @@ function M.setup()
       if exclude_ft[vim.bo[buf].filetype] or exclude_bt[vim.bo[buf].buftype] then
         return false
       end
-      drawing[win] = compute(win, buf, toprow, botrow)
+      follow(buf)
+      if edits[buf] then
+        edits[buf] = false -- drawn with them (another buffer's edits get no TextChanged)
+      end
+      -- The guides only depend on the text and the view: a cursor move draws
+      -- the same ones again.
+      local key = ("%d:%d:%d:%d:%d:%d"):format(buf, api.nvim_buf_get_changedtick(buf), toprow, botrow,
+        api.nvim_win_call(win, vim.fn.winsaveview).leftcol, vim.bo[buf].tabstop * 1000 + vim.bo[buf].shiftwidth)
+      if drawn_key[win] ~= key then
+        drawn_key[win] = key
+        drawing[win] = compute(win, buf, toprow, botrow)
+      end
     end,
     on_line = function(_, win, buf, row)
       local vt = drawing[win] and drawing[win][row]

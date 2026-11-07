@@ -90,7 +90,11 @@ local function memoize(fn, hash_fn)
   end
 end
 
-local get_indents = memoize(function(bufnr, root, lang)
+-- The captures of the nodes reaching rows first..last (0-based, end
+-- exclusive), all of them without: the indent of a line only looks at its
+-- node's ancestors and the previous line's, which reach those rows. All of
+-- a 3000-line file's took ~15 ms an Enter.
+local get_indents = memoize(function(bufnr, root, lang, first, last)
   local map = {
     ["indent.auto"] = {},
     ["indent.begin"] = {},
@@ -107,16 +111,34 @@ local get_indents = memoize(function(bufnr, root, lang)
   if not query then
     return map
   end
-  for id, node, metadata in query:iter_captures(root, bufnr) do
+  for id, node, metadata in query:iter_captures(root, bufnr, first, last) do
     if query.captures[id]:sub(1, 1) ~= "_" then
       map[query.captures[id]][node:id()] = metadata or {}
     end
   end
 
   return map
-end, function(bufnr, root, lang)
-  return tostring(bufnr) .. root:id() .. "_" .. lang
+end, function(bufnr, root, lang, first, last)
+  return tostring(bufnr) .. root:id() .. "_" .. lang .. "_" .. tostring(first) .. "_" .. tostring(last)
 end)
+
+-- Add the captures on the rows `node`'s children start on to `map` (made
+-- for other rows): each child reaches its first row.
+local function add_child_captures(map, bufnr, root, node, lang)
+  local query = ts.query.get(lang, "indents")
+  if not query then return end
+  for child in node:iter_children() do
+    local row = child:start()
+    if not map["row " .. row] then
+      map["row " .. row] = true
+      for id, n, metadata in query:iter_captures(root, bufnr, row, row + 1) do
+        if query.captures[id]:sub(1, 1) ~= "_" then
+          map[query.captures[id]][n:id()] = metadata or {}
+        end
+      end
+    end
+  end
+end
 
 ---@param lnum number (1-indexed)
 function M.get_indent(lnum)
@@ -154,8 +176,9 @@ function M.get_indent(lnum)
     return 0
   end
 
-  local q = get_indents(vim.api.nvim_get_current_buf(), root, lang_tree:lang())
   local is_empty_line = string.match(getline(lnum), "^%s*$") ~= nil
+  local first = (is_empty_line and vim.fn.prevnonblank(lnum) or lnum) - 1
+  local q = get_indents(vim.api.nvim_get_current_buf(), root, lang_tree:lang(), math.max(first, 0), lnum)
   local node ---@type TSNode
   if is_empty_line then
     local prevlnum = vim.fn.prevnonblank(lnum)
@@ -254,6 +277,8 @@ function M.get_indent(lnum)
     end
 
     if is_in_err and not q["indent.align"][node:id()] then
+      -- Its children's captures can be on other rows: add theirs.
+      add_child_captures(q, bufnr, root, node, lang_tree:lang())
       -- only when the node is in error, promote the
       -- first child's aligned indent to the error node
       -- to work around ((ERROR "X" . (_)) @aligned_indent (#set! "delimiter" "AB"))
