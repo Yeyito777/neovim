@@ -11,9 +11,13 @@
     (language) @injection.language)
   (code_fence_content) @injection.content)
 
+; Each HTML block is its own document, not one combined with every other block
+; in the file (upstream's): a combined injection makes every parse scan the
+; whole file for injections, and with the inline trees only partly parsed it
+; then drops and reparses all of them, ~5 ms and a second frame per key typed
+; in a long draft.
 ((html_block) @injection.content
   (#set! injection.language "html")
-  (#set! injection.combined)
   (#set! injection.include-children))
 
 ((minus_metadata) @injection.content
