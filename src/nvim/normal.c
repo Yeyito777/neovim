@@ -1202,13 +1202,11 @@ static int normal_execute(VimState *state, int key)
     normal_get_additional_char(s);
   }
 
-  // Flush the showcmd characters onto the screen so we can see them while
-  // the command is being executed.  Only do this when the shown command was
-  // actually displayed, otherwise this will slow down a lot when executing
-  // mappings.
-  if (s->need_flushbuf) {
-    ui_flush();
-  }
+  // The showcmd characters aren't flushed onto the screen here, for the
+  // command's run: with a TUI that is a frame of its own for every key, the
+  // command's own frame clearing them again. A command still waiting for
+  // keys (an operator, a register, a count) shows them anyway, since getting
+  // a key from the user flushes first.
 
   if (s->ca.cmdchar != K_IGNORE && s->ca.cmdchar != K_EVENT) {
     did_cursorhold = false;
