@@ -71,7 +71,7 @@ local search = {
   job = nil, ---@type table?
   -- Enter or n with no index yet: { from, direction } to select from once it lands.
   pending = nil, ---@type table?
-  memo = nil, ---@type table? the last matches(): { index, query, list }
+  memo = nil, ---@type table? recent matches(): { index, lists = { [query] = list }, n }
 }
 -- The sidebar's own command line while it is open: { mode = "search"|"command",
 -- direction, saved = the selection it started from, win, buf, shown = the
@@ -79,7 +79,7 @@ local search = {
 local bar ---@type table?
 -- The strip below the sidebar's list (its status line and the command line
 -- rows), so the sidebar runs to the bottom of the screen.
-local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer? }
+local foot = { win = nil, buf = nil } ---@type { win: integer?, buf: integer?, shown_as: string? }
 local foot_ns = api.nvim_create_namespace("yeyito.sidebar.foot")
 local match_ns = api.nvim_create_namespace("yeyito.sidebar.match")
 -- dd: the rows waiting for the second d ({ key, paths }), shown red.
@@ -218,28 +218,28 @@ end
 local function scan(dir)
   local list = {}
   local handle = uv.fs_scandir(dir)
+  local prefix = dir == "/" and "/" or dir .. "/" -- not vim.fs.joinpath: a gsub per file
   while handle do
     local name, kind = uv.fs_scandir_next(handle)
     if not name then
       break
     end
     if name ~= ".git" then
-      local path = vim.fs.joinpath(dir, name)
+      local path = prefix .. name
       local is_dir = kind == "directory"
       if kind == "link" then
         local stat = uv.fs_stat(path)
         is_dir = stat ~= nil and stat.type == "directory"
       end
-      list[#list + 1] = { name = name, path = path, dir = is_dir }
+      list[#list + 1] = { name = name, lname = name:lower(), path = path, dir = is_dir }
     end
   end
   table.sort(list, function(a, b)
     if a.dir ~= b.dir then
       return a.dir
     end
-    local la, lb = a.name:lower(), b.name:lower()
-    if la ~= lb then
-      return la < lb
+    if a.lname ~= b.lname then
+      return a.lname < b.lname
     end
     return a.name < b.name
   end)
@@ -314,7 +314,7 @@ end
 -- has hundreds of thousands of files) never freezes the editor.
 
 local INDEX_MAX = 50000 -- entries, in a folder that isn't a git repository
-local SLICE = 8e6 -- ns of index work per turn of the main loop
+local SLICE = 4e6 -- ns of index work per turn of the main loop (a key typed meanwhile waits for it)
 local SCANS = 4 -- folders being listed at once, off the main thread
 local SCAN_TIMEOUT = 2000 -- ms a folder may take to list before it is skipped
 -- Not searched into: macOS's app data, hidden by Finder. Other apps' folders
@@ -322,6 +322,7 @@ local SCAN_TIMEOUT = 2000 -- ms a folder may take to list before it is skipped
 local SKIP = uv.os_uname().sysname == "Darwin" and uv.os_homedir() .. "/Library" or nil
 
 local index_ready ---@type fun()
+local search_line ---@type fun(e: table): string the row a match is shown as
 
 local function add_kid(kids, parent, name, dir)
   local items = kids[parent]
@@ -452,6 +453,7 @@ local COUNT_WALK = 3000 -- ms a walk may spend, after that the rest stays uncoun
 local COUNT_ROWS = 10000 -- folders a walk reports, the nearest the top: taking them in stays quick
 local COUNT_HUNG = 15000 -- ms before a walk stuck on a folder that doesn't answer is given up on
 local COUNT_FRESH = 60 -- s a saved count is good for when Neovim starts
+local TAKE = 65536 -- bytes of a walk's numbers taken in per turn of the main loop
 local count_job ---@type table? the walk running
 local count_list = {} ---@type string[] folders to count when it ends (what the walk of the project didn't reach)
 local count_again = false -- the project is to be walked when that's possible
@@ -613,14 +615,18 @@ local function counts_file(dir)
 end
 
 --- Take in what a walk wrote. `changed`: gets the folders whose number is new.
---- Returns the end of `data` that is not a whole row yet.
-local function take_counts(data, changed)
+--- Returns the end of `data` that is not taken yet (not a whole row, or past
+--- `limit` bytes), and whether it stopped at the limit.
+local function take_counts(data, changed, limit)
   local from = 1
   while true do
+    if limit and from > limit then
+      return data:sub(from), true
+    end
     local a = data:find("\0", from, true)
     local b = a and data:find("\0", a + 1, true)
     if not b then
-      return data:sub(from)
+      return data:sub(from), false
     end
     local n, path = tonumber(data:sub(from, a - 1)), data:sub(a + 1, b - 1)
     if counts[path] ~= n then
@@ -648,7 +654,7 @@ end
 local next_count
 
 local function count_visible()
-  for _, row in ipairs(rows) do
+  for _, row in ipairs(rows[1] and rows[1].rel and {} or rows) do -- a search's matches have no numbers
     if row.dir and not row.rel and not expanded[row.path] and counts[row.path] == nil and row.path ~= SKIP
       and not count_queued[row.path] then
       count_queued[row.path] = true
@@ -686,9 +692,12 @@ local function start_count(dirs, cache)
     end
   end
   --- With the sidebar closed the numbers of the project wait in the file.
+  --- Returns whether there is more to take: a walk's last write can be all
+  --- its numbers (10,000 rows, 10 ms on whale), taken a slice at a time.
   local function take()
-    if chunks[1] and (not cache or sidebar_win()) then
-      rest = take_counts(rest .. table.concat(chunks), changed)
+    if (chunks[1] or rest ~= "") and (not cache or sidebar_win()) then
+      local more
+      rest, more = take_counts(rest .. table.concat(chunks), changed, TAKE)
       chunks = {}
       if next(changed) and not redraw_set then
         redraw_set = true
@@ -698,11 +707,15 @@ local function start_count(dirs, cache)
           end
         end))
       end
+      return more
     end
   end
   local function ended()
     if count_job ~= job then
       return -- given up on
+    end
+    if take() then
+      return vim.defer_fn(ended, 1) -- a timer, so keys typed meanwhile go first
     end
     hung:close()
     uv.fs_close(leave.write)
@@ -711,7 +724,6 @@ local function start_count(dirs, cache)
     if cache and not sidebar_win() then
       counts_read[dirs[1]] = nil
     else
-      take()
       show()
     end
     redraw:close()
@@ -809,7 +821,7 @@ M._prefetch = prefetch -- for tests
 
 --- The entries in tree order: each folder's contents sorted as the tree
 --- sorts them, after the folder.
-local function emit(dir, kids, check)
+local function emit(dir, kids, check, old)
   local function less(a, b)
     if a.dir ~= b.dir then
       return a.dir
@@ -853,6 +865,14 @@ local function emit(dir, kids, check)
     else
       local rel = top.rel == "" and k.name or top.rel .. "/" .. k.name
       local e = { rel = rel, name = k.name, lname = k.lname, path = prefix .. rel, dir = k.dir, depth = 0, order = #list + 1 }
+      -- Its row, made here rather than as a key is typed (a first letter can
+      -- match 40,000 of them); the last index has most of them made already.
+      local o = old and old[e.path]
+      if o and o.dir == e.dir and o.line then
+        e.line, e.line_e = o.line, o.line_e
+      else
+        search_line(e)
+      end
       list[#list + 1] = e
       by_path[e.path] = e
       if k.dir and kids[rel] then
@@ -864,6 +884,29 @@ local function emit(dir, kids, check)
   return list, by_path
 end
 
+--- The index's lowercased names (or project-relative paths with `path`) in
+--- one string, and where each entry's starts in it: a plain find in C goes
+--- through 50,000 names in a fraction of a millisecond, a find per entry
+--- takes several (20 on the Mac).
+local function haystack(index, path, check)
+  local field = path and "rel_hay" or "name_hay"
+  local hay = index[field]
+  if not hay then
+    local parts, starts, at = {}, {}, 1
+    for i, e in ipairs(index) do
+      local s = path and e.rel:lower() or e.lname
+      parts[i], starts[i] = s, at
+      at = at + #s + 1
+      if check then
+        check()
+      end
+    end
+    hay = { text = table.concat(parts, "\n"), starts = starts }
+    index[field] = hay
+  end
+  return hay
+end
+
 --- Build the index of the root anew in the background (unless that is
 --- already happening); `index_ready` runs when it lands.
 local function start_index()
@@ -873,6 +916,7 @@ local function start_index()
   local job = { root = root }
   search.job = job
   local kids = {}
+  local old = search.index_root == root and search.by_path or nil
   local deadline = 0
   local function check()
     if uv.hrtime() > deadline then
@@ -884,7 +928,9 @@ local function start_index()
     if git_out then
       from_git(git_out, kids, check)
     end
-    return emit(job.root, kids, check)
+    local list, by_path = emit(job.root, kids, check, old)
+    haystack(list, false, check) -- for the first letter typed
+    return list, by_path
   end)
   local function resume(git_out)
     if search.job ~= job then
@@ -936,22 +982,37 @@ local function matches(query)
     return {}
   end
   local memo = search.memo
-  if memo and memo.index == index and memo.query == query then
-    return memo.list
+  if not (memo and memo.index == index) then
+    memo = { index = index, lists = {}, n = 0 }
+    search.memo = memo
   end
-  local lq, by_path = query:lower(), query:find("/", 1, true)
-  local out = {}
-  for _, e in ipairs(index) do
-    local hay = e.lname
-    if by_path then
-      hay = e.lrel or e.rel:lower()
-      e.lrel = hay
-    end
-    if hay:find(lq, 1, true) then
-      out[#out + 1] = e
-    end
+  local out = memo.lists[query]
+  if out then
+    return out -- typed before: a backspace
   end
-  search.memo = { index = index, query = query, list = out }
+  local hay = haystack(index, query:find("/", 1, true) ~= nil)
+  local text, starts, last = hay.text, hay.starts, #index
+  local lq = query:lower()
+  out = {}
+  local i, from = 1, 1
+  while last > 0 do
+    local s = text:find(lq, from, true)
+    if not s then
+      break
+    end
+    while i < last and starts[i + 1] <= s do
+      i = i + 1
+    end
+    out[#out + 1] = index[i]
+    if i == last then
+      break
+    end
+    from = starts[i + 1] -- the next entry
+  end
+  if memo.n >= 16 then -- a first letter's list, with its rows, can be megabytes
+    memo.lists, memo.n = {}, 0
+  end
+  memo.lists[query], memo.n = out, memo.n + 1
   return out
 end
 
@@ -960,6 +1021,24 @@ end
 local function next_match(list, from, direction)
   if #list == 0 then
     return nil
+  end
+  -- From an entry of the index: by its place, the list being in that order.
+  local at = from and list[1].order and search.by_path and search.by_path[from.path]
+  if at then
+    local lo, hi = 1, #list + 1 -- the first match after it
+    while lo < hi do
+      local mid = math.floor((lo + hi) / 2)
+      if list[mid].order > at.order then
+        hi = mid
+      else
+        lo = mid + 1
+      end
+    end
+    if direction == "forward" then
+      return list[lo] or list[1]
+    end
+    local i = list[lo - 1] == at and lo - 2 or lo - 1
+    return list[i] or list[#list]
   end
   if direction == "forward" then
     for _, e in ipairs(list) do
@@ -1136,6 +1215,11 @@ local function label(row, width)
   return printable(row.name)
 end
 
+search_line = function(e)
+  e.line, e.line_e = "  " .. label(e), ellipsis -- sized to fit already
+  return e.line
+end
+
 local function cursor_row(win)
   return rows[api.nvim_win_get_cursor(win)[1]]
 end
@@ -1186,9 +1270,19 @@ local function draw_current()
   api.nvim_buf_clear_namespace(buf, ns, 0, -1)
   local win = editor_win()
   local current = win and vim.fs.normalize(api.nvim_buf_get_name(api.nvim_win_get_buf(win))) or ""
+  local function bold(i)
+    api.nvim_buf_set_extmark(buf, ns, i - 1, 0, { end_col = #api.nvim_buf_get_lines(buf, i - 1, i, true)[1], hl_group = "YeyitoSidebarCurrent" })
+  end
+  if rows.at then -- a search's matches: by its place
+    local i = rows.at[current]
+    if i and not rows[i].dir then
+      bold(i)
+    end
+    return
+  end
   for i, row in ipairs(rows) do
     if not row.dir and row.path == current then
-      api.nvim_buf_set_extmark(buf, ns, i - 1, 0, { end_col = #api.nvim_buf_get_lines(buf, i - 1, i, true)[1], hl_group = "YeyitoSidebarCurrent" })
+      bold(i)
     end
   end
 end
@@ -1232,6 +1326,8 @@ local function highlight_matches()
   })
 end
 
+local shown = { buf = nil, lines = {} } -- what the buffer holds
+
 function render(keep_path)
   if not (buf and api.nvim_buf_is_valid(buf)) then
     return
@@ -1245,30 +1341,52 @@ function render(keep_path)
   end
   local lines = {}
   local target
-  for i, row in ipairs(rows) do
-    local line = row.line -- a search match keeps its line: the index doesn't change under it
-    if row.rel and not line then
-      line = "  " .. label(row) -- sized to fit already
-      row.line = line
-    elseif not line then
-      local indent = "  " .. INDENT:rep(row.depth)
-      line = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
+  if rows[1] and rows[1].rel then
+    -- A search's matches: their lines and places are kept with the list,
+    -- for the next key (n, N, a backspace) and the next render.
+    if rows.lines_e ~= ellipsis then
+      local at = {}
+      for i, row in ipairs(rows) do
+        lines[i] = row.line_e == ellipsis and row.line or search_line(row)
+        at[row.path] = i
+      end
+      rows.lines, rows.at, rows.lines_e = lines, at, ellipsis
     end
-    lines[i] = line
-    if row.path == keep_path then
-      target = i
+    lines, target = rows.lines, keep_path and rows.at[keep_path]
+  else
+    for i, row in ipairs(rows) do
+      local indent = "  " .. INDENT:rep(row.depth)
+      lines[i] = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
+      if row.path == keep_path then
+        target = i
+      end
     end
   end
   local query = active_query()
   if query and #rows == 0 then
     lines = { current_index() and "  no matches" or "  searching…" }
   end
-  vim.bo[buf].modifiable = true
-  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
+  -- The same rows (n in a search, a number that didn't change): the
+  -- buffer stays, and so does the screen.
+  local same = shown.buf == buf and #shown.lines == #lines
+  for i = 1, same and shown.lines ~= lines and #lines or 0 do
+    if lines[i] ~= shown.lines[i] then
+      same = false
+      break
+    end
+  end
+  if not same then
+    vim.bo[buf].modifiable = true
+    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    shown.buf, shown.lines = buf, lines
+  end
   shown_query = query and query:lower() or nil
   if win then
-    vim.wo[win].winbar = header()
+    local bar_text = header()
+    if vim.wo[win].winbar ~= bar_text then
+      vim.wo[win].winbar = bar_text
+    end
     if target then
       api.nvim_win_set_cursor(win, { target, 0 })
     end
@@ -1297,14 +1415,14 @@ function refresh(soon)
   end))
 end
 
---- Expand the folders down to `path` and select it.
+--- Expand the folders down to `path` and select it. Returns whether it drew.
 local function reveal(path)
   if active_query() then
     render(path)
-    return
+    return true
   end
   if not (root and path and path ~= "" and vim.startswith(path, root .. "/")) then
-    return
+    return false
   end
   local dir = vim.fs.dirname(path)
   while dir and dir ~= root and #dir > #root do
@@ -1312,6 +1430,7 @@ local function reveal(path)
     dir = vim.fs.dirname(dir)
   end
   render(path)
+  return true
 end
 
 function M.reveal(path)
@@ -1333,6 +1452,10 @@ local function open_file(path)
     vim.cmd("botright vnew")
     win = api.nvim_get_current_win()
     main_win[api.nvim_get_current_tabpage()] = win
+  end
+  -- Already there: :edit would read it again (a full repaint, 20-60 ms).
+  if vim.fs.normalize(api.nvim_buf_get_name(api.nvim_win_get_buf(win))) == path then
+    return
   end
   api.nvim_win_call(win, function()
     vim.cmd.edit(vim.fn.fnameescape(path))
@@ -1419,6 +1542,14 @@ local function update_foot()
     close_foot()
     return
   end
+  local filter = search.filter and search.query ~= "" and not bar
+  local border = focused() and "YeyitoSidebarBorderFocused" or "YeyitoSidebarBorder"
+  local shown_as = table.concat({ top, height, border, filter and search.direction .. search.query or "" }, "\0")
+  if foot.win and api.nvim_win_is_valid(foot.win) and api.nvim_win_get_tabpage(foot.win) == api.nvim_get_current_tabpage()
+    and foot.shown_as == shown_as then
+    return -- as it is (Tab, n, each render)
+  end
+  foot.shown_as = shown_as
   if not (foot.buf and api.nvim_buf_is_valid(foot.buf)) then
     foot.buf = api.nvim_create_buf(false, true)
     vim.bo[foot.buf].bufhidden = "hide"
@@ -1429,14 +1560,13 @@ local function update_foot()
   end
   -- The last search stays on show while the list is filtered, like the
   -- editor's command line shows it.
-  if search.filter and search.query ~= "" and not bar then
+  if filter then
     local text = " " .. (search.direction == "forward" and "/" or "?") .. search.query
     text = truncate(text, WIDTH - 2)
     lines[height] = text .. (" "):rep(WIDTH - 1 - vim.fn.strdisplaywidth(text)) .. "│"
   end
   api.nvim_buf_set_lines(foot.buf, 0, -1, false, lines)
   api.nvim_buf_clear_namespace(foot.buf, foot_ns, 0, -1)
-  local border = focused() and "YeyitoSidebarBorderFocused" or "YeyitoSidebarBorder"
   for i, line in ipairs(lines) do
     api.nvim_buf_set_extmark(foot.buf, foot_ns, i - 1, #line - #"│", { end_col = #line, hl_group = border })
   end
@@ -1525,12 +1655,14 @@ index_ready = function()
   end
 end
 
+local NOH = { noh = true, nohl = true, nohlsearch = true }
+
 local function run_command(cmd)
   cmd = vim.trim(cmd)
   if cmd == "" then
     return
   end
-  if cmd == "noh" or cmd == "nohl" or cmd == "nohlsearch" then
+  if NOH[cmd] then
     local sel = selected_entry()
     search.filter = false
     if sel then
@@ -1565,6 +1697,9 @@ local function submit_bar()
   local input = api.nvim_buf_get_lines(b.buf, 0, 1, false)[1] or ""
   if b.mode == "command" then
     close_bar(false)
+    if NOH[vim.trim(input)] then
+      return run_command(input) -- the sidebar's own: in the same frame as the bar closing
+    end
     -- After the bar's insert mode has ended: leaving it clears the command
     -- line, which would take the command's messages with it.
     vim.schedule(function()
@@ -2950,8 +3085,9 @@ function M.open()
     api.nvim_set_current_win(win)
   end
   children = {}
-  render()
-  reveal(file)
+  if not reveal(file) then
+    render()
+  end
   update_foot()
 end
 
