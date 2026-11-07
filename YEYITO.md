@@ -35,6 +35,13 @@ What's on top of upstream (`git log v0.12.2..yeyito`):
 - **Visual range label** (Lua, `runtime/lua/vim/_core/ui2/cmdline.lua`): `:` in
   visual mode shows `[+ 12 lines]` instead of `'<,'>` and keeps the selection
   highlighted (see [Command line and messages](#command-line-and-messages)).
+- **Queries compiled in the background** (C, `src/nvim/lua/treesitter.c`):
+  `vim._ts_precompile_query(lang, source)` compiles a tree-sitter query on
+  libuv's thread pool, and `vim._ts_parse_query` takes it (waiting if it isn't
+  done). Big grammars' queries take a while (on the Mac, TSX's highlights
+  185 ms, injections 177 ms): `treesitter.lua` has a language's highlights
+  and indents compile there while the parser's injections compile, on its
+  first file.
 - **Bundled parsers**: python cpp java bash javascript typescript tsx html css
   rust, besides upstream's c lua vim vimdoc query markdown
   (`cmake.deps/deps.txt`, pinned to nvim-treesitter's lockfile).
