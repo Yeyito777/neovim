@@ -1009,7 +1009,7 @@ local function matches(query)
     end
     from = starts[i + 1] -- the next entry
   end
-  if memo.n >= 32 then
+  if memo.n >= 16 then -- a first letter's list, with its rows, can be megabytes
     memo.lists, memo.n = {}, 0
   end
   memo.lists[query], memo.n = out, memo.n + 1
