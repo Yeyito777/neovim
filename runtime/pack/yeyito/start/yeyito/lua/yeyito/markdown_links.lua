@@ -382,6 +382,12 @@ local function attach(buf)
   api.nvim_buf_create_user_command(buf, 'MarkdownLinksToggle', M.toggle_all, {})
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do configure_window(win) end
   M.refresh(buf)
+  -- Once it's drawn (only the view was parsed for that), parse the rest in
+  -- the background, 3 ms at a time: scrolling then has nothing to parse.
+  vim.schedule(function()
+    local ok, parser = pcall(vim.treesitter.get_parser, buf, 'markdown')
+    if ok and api.nvim_buf_is_valid(buf) then parser:parse(true, function() end) end
+  end)
 end
 
 function M.setup()
