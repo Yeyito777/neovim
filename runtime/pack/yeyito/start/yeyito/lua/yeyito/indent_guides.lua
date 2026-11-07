@@ -155,6 +155,60 @@ end
 
 local drawing = {} ---@type table<integer, table<integer, table>>
 
+-- Edits ({row, old_rows, new_rows}) since the guides were last checked, per
+-- buffer followed; false: followed, none.
+local edits = {} ---@type table<integer, table[]|false>
+
+local function follow(buf)
+  if edits[buf] ~= nil then return end
+  edits[buf] = false
+  api.nvim_buf_attach(buf, false, {
+    on_bytes = function(_, b, _, row, _, _, old_rows, _, _, new_rows)
+      if edits[b] == nil then return true end
+      edits[b] = edits[b] or {}
+      table.insert(edits[b], { row, old_rows, new_rows })
+    end,
+    on_detach = function(_, b) edits[b] = nil end,
+  })
+end
+
+local function same(a, b)
+  if a == nil or b == nil then return a == b end
+  if #a ~= #b then return false end
+  for i = 1, #a do
+    if a[i][1] ~= b[i][1] then return false end
+  end
+  return true
+end
+
+-- The rows (first, last) of `win` whose guides the edits changed besides the
+-- lines they changed, which are drawn again anyway.
+local function stale_rows(win, buf, changes)
+  local old = drawing[win]
+  if not old then return end
+  for _, e in ipairs(changes) do
+    local row, old_rows, new_rows = e[1], e[2], e[3]
+    local moved = {}
+    for r, vt in pairs(old) do
+      if r < row then
+        moved[r] = vt
+      elseif r > row + old_rows then
+        moved[r + new_rows - old_rows] = vt
+      end
+    end
+    old = moved
+  end
+  local top, bot = vim.fn.line("w0", win) - 1, vim.fn.line("w$", win) - 1
+  local now = compute(win, buf, top, bot)
+  local first, last
+  for r = top, bot do
+    if not same(now[r], old[r]) then
+      first, last = first or r, r
+    end
+  end
+  return first, last
+end
+
 function M.setup()
   local colors = require("yeyito.colors")
   local function highlights()
@@ -165,28 +219,38 @@ function M.setup()
   api.nvim_create_autocmd("ColorScheme", { group = group, callback = highlights })
 
   -- A line's guides depend on the lines around it, but Neovim only redraws
-  -- the lines that changed: redraw the window when indentation may have
-  -- shifted (line count, or the edited line's indent or blankness changed).
-  local last = {} ---@type table<integer, string>
-  api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP", "InsertLeave" }, {
+  -- the lines that changed: before the screen is drawn, work out which other
+  -- lines' guides an edit changed and have those drawn too, in the same
+  -- frame. (Redrawing the window once it was drawn was a second frame per
+  -- change, and a whole window drawn again.)
+  api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
     group = group,
     callback = function(args)
-      if exclude_ft[vim.bo[args.buf].filetype] or exclude_bt[vim.bo[args.buf].buftype] then
+      local buf = args.buf
+      if exclude_ft[vim.bo[buf].filetype] or exclude_bt[vim.bo[buf].buftype] then
         return
       end
-      local line = api.nvim_get_current_line()
-      local key = ("%d:%s:%s"):format(api.nvim_buf_line_count(args.buf), line:match("^%s*"), line:find("%S") and 1 or 0)
-      if args.event == "TextChanged" or args.event == "InsertLeave" or last[args.buf] ~= key then
-        -- Once the screen is drawn. Now, it would draw ahead of later autocommands
-        -- (or, with flush = false, its full redraw would replace the scroll a
-        -- deleted line makes).
+      local changes = edits[buf]
+      if changes == false then return end
+      if changes == nil then
+        -- Not followed yet: what changed is unknown.
+        follow(buf)
         vim.schedule(function()
-          if api.nvim_buf_is_valid(args.buf) then
-            api.nvim__redraw({ buf = args.buf, valid = false })
+          if api.nvim_buf_is_valid(buf) then
+            api.nvim__redraw({ buf = buf, valid = false })
           end
         end)
+        return
       end
-      last[args.buf] = key
+      edits[buf] = false
+      for _, win in ipairs(api.nvim_tabpage_list_wins(0)) do
+        if api.nvim_win_get_buf(win) == buf then
+          local first, last = stale_rows(win, buf, changes)
+          if first then
+            api.nvim__redraw({ win = win, range = { first, last + 1 }, flush = false })
+          end
+        end
+      end
     end,
   })
 
@@ -194,6 +258,10 @@ function M.setup()
     on_win = function(_, win, buf, toprow, botrow)
       if exclude_ft[vim.bo[buf].filetype] or exclude_bt[vim.bo[buf].buftype] then
         return false
+      end
+      follow(buf)
+      if edits[buf] then
+        edits[buf] = false -- drawn with them (another buffer's edits get no TextChanged)
       end
       drawing[win] = compute(win, buf, toprow, botrow)
     end,
