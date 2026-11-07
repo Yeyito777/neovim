@@ -1334,6 +1334,10 @@ local function open_file(path)
     win = api.nvim_get_current_win()
     main_win[api.nvim_get_current_tabpage()] = win
   end
+  -- Already there: :edit would read it again (a full repaint, 20-60 ms).
+  if vim.fs.normalize(api.nvim_buf_get_name(api.nvim_win_get_buf(win))) == path then
+    return
+  end
   api.nvim_win_call(win, function()
     vim.cmd.edit(vim.fn.fnameescape(path))
   end)
