@@ -218,28 +218,28 @@ end
 local function scan(dir)
   local list = {}
   local handle = uv.fs_scandir(dir)
+  local prefix = dir == "/" and "/" or dir .. "/" -- not vim.fs.joinpath: a gsub per file
   while handle do
     local name, kind = uv.fs_scandir_next(handle)
     if not name then
       break
     end
     if name ~= ".git" then
-      local path = vim.fs.joinpath(dir, name)
+      local path = prefix .. name
       local is_dir = kind == "directory"
       if kind == "link" then
         local stat = uv.fs_stat(path)
         is_dir = stat ~= nil and stat.type == "directory"
       end
-      list[#list + 1] = { name = name, path = path, dir = is_dir }
+      list[#list + 1] = { name = name, lname = name:lower(), path = path, dir = is_dir }
     end
   end
   table.sort(list, function(a, b)
     if a.dir ~= b.dir then
       return a.dir
     end
-    local la, lb = a.name:lower(), b.name:lower()
-    if la ~= lb then
-      return la < lb
+    if a.lname ~= b.lname then
+      return a.lname < b.lname
     end
     return a.name < b.name
   end)
