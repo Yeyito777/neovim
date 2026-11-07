@@ -71,7 +71,7 @@ local search = {
   job = nil, ---@type table?
   -- Enter or n with no index yet: { from, direction } to select from once it lands.
   pending = nil, ---@type table?
-  memo = nil, ---@type table? the last matches(): { index, query, list }
+  memo = nil, ---@type table? recent matches(): { index, lists = { [query] = list }, n }
 }
 -- The sidebar's own command line while it is open: { mode = "search"|"command",
 -- direction, saved = the selection it started from, win, buf, shown = the
@@ -314,7 +314,7 @@ end
 -- has hundreds of thousands of files) never freezes the editor.
 
 local INDEX_MAX = 50000 -- entries, in a folder that isn't a git repository
-local SLICE = 8e6 -- ns of index work per turn of the main loop
+local SLICE = 4e6 -- ns of index work per turn of the main loop (a key typed meanwhile waits for it)
 local SCANS = 4 -- folders being listed at once, off the main thread
 local SCAN_TIMEOUT = 2000 -- ms a folder may take to list before it is skipped
 -- Not searched into: macOS's app data, hidden by Finder. Other apps' folders
@@ -322,6 +322,7 @@ local SCAN_TIMEOUT = 2000 -- ms a folder may take to list before it is skipped
 local SKIP = uv.os_uname().sysname == "Darwin" and uv.os_homedir() .. "/Library" or nil
 
 local index_ready ---@type fun()
+local search_line ---@type fun(e: table): string the row a match is shown as
 
 local function add_kid(kids, parent, name, dir)
   local items = kids[parent]
@@ -809,7 +810,7 @@ M._prefetch = prefetch -- for tests
 
 --- The entries in tree order: each folder's contents sorted as the tree
 --- sorts them, after the folder.
-local function emit(dir, kids, check)
+local function emit(dir, kids, check, old)
   local function less(a, b)
     if a.dir ~= b.dir then
       return a.dir
@@ -853,6 +854,14 @@ local function emit(dir, kids, check)
     else
       local rel = top.rel == "" and k.name or top.rel .. "/" .. k.name
       local e = { rel = rel, name = k.name, lname = k.lname, path = prefix .. rel, dir = k.dir, depth = 0, order = #list + 1 }
+      -- Its row, made here rather than as a key is typed (a first letter can
+      -- match 40,000 of them); the last index has most of them made already.
+      local o = old and old[e.path]
+      if o and o.dir == e.dir and o.line then
+        e.line, e.line_e = o.line, o.line_e
+      else
+        search_line(e)
+      end
       list[#list + 1] = e
       by_path[e.path] = e
       if k.dir and kids[rel] then
@@ -873,6 +882,7 @@ local function start_index()
   local job = { root = root }
   search.job = job
   local kids = {}
+  local old = search.index_root == root and search.by_path or nil
   local deadline = 0
   local function check()
     if uv.hrtime() > deadline then
@@ -884,7 +894,7 @@ local function start_index()
     if git_out then
       from_git(git_out, kids, check)
     end
-    return emit(job.root, kids, check)
+    return emit(job.root, kids, check, old)
   end)
   local function resume(git_out)
     if search.job ~= job then
@@ -926,6 +936,26 @@ local function current_index()
   return search.index_root == root and search.index or nil
 end
 
+--- The index's lowercased names (or project-relative paths with `path`) in
+--- one string, and where each entry's starts in it: a plain find in C goes
+--- through 50,000 names in a fraction of a millisecond, a find per entry
+--- takes several (20 on the Mac).
+local function haystack(index, path)
+  local field = path and "rel_hay" or "name_hay"
+  local hay = index[field]
+  if not hay then
+    local parts, starts, at = {}, {}, 1
+    for i, e in ipairs(index) do
+      local s = path and e.rel:lower() or e.lname
+      parts[i], starts[i] = s, at
+      at = at + #s + 1
+    end
+    hay = { text = table.concat(parts, "\n"), starts = starts }
+    index[field] = hay
+  end
+  return hay
+end
+
 --- Entries matching `query`: case-insensitive, in the name, or in the
 --- project-relative path when the query has a /. Empty while there is no
 --- index yet (it starts building).
@@ -936,22 +966,37 @@ local function matches(query)
     return {}
   end
   local memo = search.memo
-  if memo and memo.index == index and memo.query == query then
-    return memo.list
+  if not (memo and memo.index == index) then
+    memo = { index = index, lists = {}, n = 0 }
+    search.memo = memo
   end
-  local lq, by_path = query:lower(), query:find("/", 1, true)
-  local out = {}
-  for _, e in ipairs(index) do
-    local hay = e.lname
-    if by_path then
-      hay = e.lrel or e.rel:lower()
-      e.lrel = hay
-    end
-    if hay:find(lq, 1, true) then
-      out[#out + 1] = e
-    end
+  local out = memo.lists[query]
+  if out then
+    return out -- typed before: a backspace
   end
-  search.memo = { index = index, query = query, list = out }
+  local hay = haystack(index, query:find("/", 1, true))
+  local text, starts, last = hay.text, hay.starts, #index
+  local lq = query:lower()
+  out = {}
+  local i, from = 1, 1
+  while last > 0 do
+    local s = text:find(lq, from, true)
+    if not s then
+      break
+    end
+    while i < last and starts[i + 1] <= s do
+      i = i + 1
+    end
+    out[#out + 1] = index[i]
+    if i == last then
+      break
+    end
+    from = starts[i + 1] -- the next entry
+  end
+  if memo.n >= 32 then
+    memo.lists, memo.n = {}, 0
+  end
+  memo.lists[query], memo.n = out, memo.n + 1
   return out
 end
 
@@ -1136,6 +1181,11 @@ local function label(row, width)
   return printable(row.name)
 end
 
+search_line = function(e)
+  e.line, e.line_e = "  " .. label(e), ellipsis -- sized to fit already
+  return e.line
+end
+
 local function cursor_row(win)
   return rows[api.nvim_win_get_cursor(win)[1]]
 end
@@ -1232,6 +1282,8 @@ local function highlight_matches()
   })
 end
 
+local shown = { buf = nil, lines = {} } -- what the buffer holds
+
 function render(keep_path)
   if not (buf and api.nvim_buf_is_valid(buf)) then
     return
@@ -1247,9 +1299,8 @@ function render(keep_path)
   local target
   for i, row in ipairs(rows) do
     local line = row.line -- a search match keeps its line: the index doesn't change under it
-    if row.rel and not line then
-      line = "  " .. label(row) -- sized to fit already
-      row.line = line
+    if row.rel and (not line or row.line_e ~= ellipsis) then
+      line = search_line(row)
     elseif not line then
       local indent = "  " .. INDENT:rep(row.depth)
       line = indent .. truncate(label(row, WIDTH - 1 - #indent), WIDTH - 1 - #indent)
@@ -1263,12 +1314,27 @@ function render(keep_path)
   if query and #rows == 0 then
     lines = { current_index() and "  no matches" or "  searching…" }
   end
-  vim.bo[buf].modifiable = true
-  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].modifiable = false
+  -- The same rows (n in a search, a number that didn't change): the
+  -- buffer stays, and so does the screen.
+  local same = shown.buf == buf and #shown.lines == #lines
+  for i = 1, same and #lines or 0 do
+    if lines[i] ~= shown.lines[i] then
+      same = false
+      break
+    end
+  end
+  if not same then
+    vim.bo[buf].modifiable = true
+    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].modifiable = false
+    shown.buf, shown.lines = buf, lines
+  end
   shown_query = query and query:lower() or nil
   if win then
-    vim.wo[win].winbar = header()
+    local bar_text = header()
+    if vim.wo[win].winbar ~= bar_text then
+      vim.wo[win].winbar = bar_text
+    end
     if target then
       api.nvim_win_set_cursor(win, { target, 0 })
     end
