@@ -453,6 +453,7 @@ local COUNT_WALK = 3000 -- ms a walk may spend, after that the rest stays uncoun
 local COUNT_ROWS = 10000 -- folders a walk reports, the nearest the top: taking them in stays quick
 local COUNT_HUNG = 15000 -- ms before a walk stuck on a folder that doesn't answer is given up on
 local COUNT_FRESH = 60 -- s a saved count is good for when Neovim starts
+local TAKE = 65536 -- bytes of a walk's numbers taken in per turn of the main loop
 local count_job ---@type table? the walk running
 local count_list = {} ---@type string[] folders to count when it ends (what the walk of the project didn't reach)
 local count_again = false -- the project is to be walked when that's possible
@@ -614,14 +615,18 @@ local function counts_file(dir)
 end
 
 --- Take in what a walk wrote. `changed`: gets the folders whose number is new.
---- Returns the end of `data` that is not a whole row yet.
-local function take_counts(data, changed)
+--- Returns the end of `data` that is not taken yet (not a whole row, or past
+--- `limit` bytes), and whether it stopped at the limit.
+local function take_counts(data, changed, limit)
   local from = 1
   while true do
+    if limit and from > limit then
+      return data:sub(from), true
+    end
     local a = data:find("\0", from, true)
     local b = a and data:find("\0", a + 1, true)
     if not b then
-      return data:sub(from)
+      return data:sub(from), false
     end
     local n, path = tonumber(data:sub(from, a - 1)), data:sub(a + 1, b - 1)
     if counts[path] ~= n then
@@ -687,9 +692,12 @@ local function start_count(dirs, cache)
     end
   end
   --- With the sidebar closed the numbers of the project wait in the file.
+  --- Returns whether there is more to take: a walk's last write can be all
+  --- its numbers (10,000 rows, 10 ms on whale), taken a slice at a time.
   local function take()
-    if chunks[1] and (not cache or sidebar_win()) then
-      rest = take_counts(rest .. table.concat(chunks), changed)
+    if (chunks[1] or rest ~= "") and (not cache or sidebar_win()) then
+      local more
+      rest, more = take_counts(rest .. table.concat(chunks), changed, TAKE)
       chunks = {}
       if next(changed) and not redraw_set then
         redraw_set = true
@@ -699,11 +707,15 @@ local function start_count(dirs, cache)
           end
         end))
       end
+      return more
     end
   end
   local function ended()
     if count_job ~= job then
       return -- given up on
+    end
+    if take() then
+      return vim.defer_fn(ended, 1) -- a timer, so keys typed meanwhile go first
     end
     hung:close()
     uv.fs_close(leave.write)
@@ -712,7 +724,6 @@ local function start_count(dirs, cache)
     if cache and not sidebar_win() then
       counts_read[dirs[1]] = nil
     else
-      take()
       show()
     end
     redraw:close()
