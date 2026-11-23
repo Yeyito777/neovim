@@ -30,6 +30,8 @@ function M.setup()
   require("yeyito.markdown_links").setup()
   -- <leader>a / :Ai: the AI edits the project through Neovim (Exocortex daemon).
   require("yeyito.ai").setup()
+  -- keys.sh, secrets.sh: what's between < and > shows as dots off the cursor.
+  require("yeyito.censor").setup()
 end
 
 return M

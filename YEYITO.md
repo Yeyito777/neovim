@@ -388,6 +388,13 @@ Exocortex's fake daemon: needs bun and an Exocortex checkout);
 `python3 test/yeyito/test_ai_shared.py` (real Neovims sharing a conversation on
 the fake daemon).
 
+## Censored files (`keys.sh`, `secrets.sh`)
+
+In a file named `keys.sh` or `secrets.sh` (`g:yeyito_censored_files`, by name),
+what's between `<` and `>` on a line shows as dots, except the span the cursor
+is on. Only the display (`censor.lua`): the file, yanks and searches have the
+real text. Test: `python3 test/yeyito/test_censor.py`.
+
 ## Command line and messages
 
 The command line and messages are ui2 (`vim._core.ui2`, upstream's
