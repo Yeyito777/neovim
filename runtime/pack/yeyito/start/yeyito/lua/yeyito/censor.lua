@@ -8,7 +8,7 @@ local M = {}
 
 local api = vim.api
 local ns = api.nvim_create_namespace("yeyito.censor")
-local DOT = "•"
+local DOT = "*"
 
 local function censored(buf)
   local name = api.nvim_buf_get_name(buf)
