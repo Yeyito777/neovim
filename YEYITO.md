@@ -391,8 +391,10 @@ the fake daemon).
 ## Censored files (`keys.sh`, `secrets.sh`)
 
 In a file named `keys.sh` or `secrets.sh` (`g:yeyito_censored_files`, by name),
-what's between `<` and `>` on a line shows as dots, except the span the cursor
-is on. Only the display (`censor.lua`): the file, yanks and searches have the
+the value of each assignment (`NAME=value`, `export NAME="value"`, to the line's
+last quote, and over several lines when the quote closes later, like a private
+key) and what's between `<` and `>` show as dots, except the value the cursor
+is on (all its lines). Only the display (`censor.lua`): the file, yanks and searches have the
 real text. Test: `python3 test/yeyito/test_censor.py`.
 
 ## Command line and messages

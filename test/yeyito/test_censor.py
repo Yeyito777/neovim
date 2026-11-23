@@ -23,10 +23,21 @@ def screen_text(screen):
 def main():
     tmp = tempfile.mkdtemp(prefix="nvim-censor-", dir=os.path.expanduser("~/.cache"))
     lines = [
-        "export OPENAI_KEY=<%s>" % SECRET,
-        "export TWO=<aa> MID <bb>",
+        "key for openai: <%s>" % SECRET,
+        "two: <aa> MID <bb>",
         "echo nothing here",
-        "export LONG=<%s>" % LONG,
+        "long: <%s>" % LONG,
+        'export QUOTED="qv-123secretA"',
+        "PLAIN=pv-456secretB other words",
+        "# COMMENTED=cv-789notsecret",
+        "export SINGLE='sv-000secretC'",
+        'export COOKIE="a=1; b={\"k\":\"jv-111secretD\"}; c=tail-222secretE"',
+        'export PEM="-----BEGIN KEY-----',
+        "pemline1-333secretF",
+        "pemline2-444secretG",
+        '-----END KEY-----"',
+        "echo after the key",
+        'export NOTE="nv-555secretH" # a note here',
     ]
     for name in ("keys.sh", "secrets.sh", "other.sh"):
         with open(os.path.join(tmp, name), "w") as f:
@@ -43,7 +54,25 @@ def main():
         text = screen_text(s)
         check("keys.sh: a secret off the cursor is dots", SECRET not in text and "<" + "•" * len(SECRET) + ">" in text, text[:300])
         check("two spans on a line, the text between them shows", "<••> MID <••>" in text, text[:400])
-        check("a secret longer than the screen line is dots all the way", "END" not in text and "x" not in text.replace("export", ""), text[:900])
+        check("a secret longer than the screen line is dots all the way", "END" not in text and "x" not in text.replace("export", "").replace("xxx", ""), text[:900])
+        check("export NAME=\"value\": the value is dots, the quotes show",
+              "qv-123secretA" not in text and 'export QUOTED="' + "•" * 13 + '"' in text, text)
+        check("NAME=value: up to the first space", "pv-456secretB" not in text and "PLAIN=" + "•" * 13 + " other words" in text, text)
+        check("quotes inside a value: dots to the last quote", "jv-111secretD" not in text and "tail-222secretE" not in text, text)
+        check("a quoted value over several lines: every line of it", "secretF" not in text and "secretG" not in text and "BEGIN" not in text and "END KEY" not in text, text)
+        check("the line after it shows", "echo after the key" in text, text)
+        check("a comment after a value shows", "nv-555secretH" not in text and "# a note here" in text, text)
+        s.feed(t.keys(b"/pemline2\r"))
+        text = screen_text(s)
+        check("the cursor in it: all of it shows", "pemline1-333secretF" in text and "pemline2-444secretG" in text and "BEGIN" in text, text)
+        s.feed(t.keys(b"G"))
+        check("and off it, all dots again", "secretF" not in screen_text(s))
+        check("single quotes too", "sv-000secretC" not in text, text)
+        check("a comment isn't an assignment", "cv-789notsecret" in text, text)
+        s.feed(t.keys(b"5G0fq"))
+        check("the cursor in a value: it shows", "qv-123secretA" in screen_text(s))
+        s.feed(t.keys(b"0"))
+        check("the cursor on the name: dots", "qv-123secretA" not in screen_text(s))
         s.feed(t.keys(b"1G"))
         s.feed(t.keys(b"0"))
         text = screen_text(s)
