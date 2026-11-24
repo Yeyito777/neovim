@@ -28,6 +28,7 @@ ROWS, COLS = 30, 100
 WIN_H = ROWS - 2  # statusline + cmdline
 
 GLIDE = re.compile(rb"\x1b\]2032;m;0;(-?\d+);100\x1b\\")
+GLIDE_ANY = re.compile(rb"\x1b\]2032;m;(-?\d+);(-?\d+);100\x1b\\")
 RECT = re.compile(rb"\x1b\]2032;r;(\d+),(\d+),(\d+),(\d+)\x1b\\")
 SNAP = b"\x1b]2032;o;0\x1b\\"
 
@@ -111,6 +112,10 @@ def frames(out):
 
 def glides(out):
     return [int(m) for m in GLIDE.findall(out)]
+
+
+def glides_any(out):
+    return [int(b) for _, b in GLIDE_ANY.findall(out)]
 
 
 class Screen:
@@ -492,6 +497,103 @@ def floats():
             t.close()
 
 
+def wrapped_and_modes():
+    """Wrapped long paragraphs (both default nosmoothscroll and smoothscroll),
+    visual mode, incsearch, and fast consecutive scrolls: every view scroll
+    glides without snapping, and the terminal screen matches Neovim cell for cell."""
+    tmp = tempfile.mkdtemp(prefix="nvim-smooth-wrapped-")
+    md = os.path.join(tmp, "essay.md")
+    with open(md, "w") as f:
+        f.write("# Essay Title\n\n")
+        for p in range(1, 50):
+            if p % 5 == 0:
+                f.write("## Section %d\n\n" % p)
+            else:
+                f.write("para%d %s\n\n" % (p, ("lorem ipsum dolor sit amet consectetur " * (8 + (p * 5) % 16))))
+
+    def check_session(name, cmds):
+        sock = os.path.join(tmp, "%s.sock" % name)
+        t = Term([md], cwd=tmp, cmds=cmds, args=["--listen", sock, "-c", "set noruler"])
+        try:
+            t.read(1.0)
+            screen = Screen()
+            fed = [0]
+
+            def same_screen():
+                screen.feed(bytes(t.log[fed[0]:]))
+                fed[0] = len(t.log)
+                out = subprocess.run([NVIM, "--clean", "--headless", "--server", sock, "--remote-expr",
+                                      "json_encode(map(range(1, %d), {_, r -> map(range(1, %d), {_, c -> screenstring(r, c)})}))" % (ROWS, COLS)],
+                                     capture_output=True, text=True, timeout=10)
+                want = json.loads(out.stdout.strip())
+                bad = [(r, c, screen.cells[r][c], want[r][c]) for r in range(ROWS) for c in range(COLS)
+                       if screen.cells[r][c] != want[r][c]]
+                if bad:
+                    t.read(0.25)
+                    screen.feed(bytes(t.log[fed[0]:]))
+                    fed[0] = len(t.log)
+                    out = subprocess.run([NVIM, "--clean", "--headless", "--server", sock, "--remote-expr",
+                                          "json_encode(map(range(1, %d), {_, r -> map(range(1, %d), {_, c -> screenstring(r, c)})}))" % (ROWS, COLS)],
+                                         capture_output=True, text=True, timeout=10)
+                    want = json.loads(out.stdout.strip())
+                    bad = [(r, c, screen.cells[r][c], want[r][c]) for r in range(ROWS) for c in range(COLS)
+                           if screen.cells[r][c] != want[r][c]]
+                return bad[:6]
+
+            steps = [
+                ("1st CTRL-D", b"\x04", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("2nd CTRL-D", b"\x04", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("1st CTRL-U", b"\x15", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("2nd CTRL-U", b"\x15", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("CTRL-F", b"\x06", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("CTRL-B", b"\x02", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("CTRL-E", b"\x05", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("CTRL-E x2", b"\x05", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("CTRL-E x3", b"\x05", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("CTRL-Y", b"\x19", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("wheel down", b"\x1b[<65;20;15M", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("wheel up", b"\x1b[<64;20;15M", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("visual V+CTRL-D", b"V\x04", lambda g: len(g) >= 1 and all(x > 0 for x in g)),
+                ("visual CTRL-U+Esc", b"\x15\x1b", lambda g: len(g) >= 1 and all(x < 0 for x in g)),
+                ("fast 2x CTRL-D", b"\x04\x04", lambda g: len(g) == 2 and all(x > 0 for x in g)),
+                ("fast 2x CTRL-U", b"\x15\x15", lambda g: len(g) == 2 and all(x < 0 for x in g)),
+                ("fast 2x CTRL-F", b"\x06\x06", lambda g: len(g) == 2 and all(x > 0 for x in g)),
+                ("fast 2x CTRL-B", b"\x02\x02", lambda g: len(g) == 2 and all(x < 0 for x in g)),
+            ]
+            for label, seq, pred in steps:
+                out = t.keys(seq, idle=0.25)
+                g = glides_any(out)
+                snapped = SNAP in out
+                check("%s: %s glides, no snap" % (name, label), pred(g) and not snapped, (g, snapped))
+                bad = same_screen()
+                check("%s: %s same screen" % (name, label), not bad, bad)
+            check("%s: marker never reaches terminal" % name, b"nvim-glide" not in t.log)
+        finally:
+            t.close()
+
+    check_session("wrapped", ())
+    check_session("wrapped-sms", ("set smoothscroll",))
+
+    # Incremental search glides when scrolling within a screen.
+    path = sample(200)
+    t = Term([path])
+    try:
+        t.read(1.0)
+        out = t.keys(b"/line 40", idle=0.25)
+        g = glides_any(out)
+        check("incsearch glides", len(g) == 1 and g[0] > 0 and SNAP not in out, (g, SNAP in out))
+        out = t.keys(b"\r", idle=0.25)
+        check("incsearch confirm does not snap", SNAP not in out)
+        # Fast burst of wheel events exceeding window height clamps instead of snapping.
+        out = t.keys(b"\x1b[<65;10;10M" * 15, idle=0.3)
+        g = glides_any(out)
+        check("fast wheel burst past screen height glides without snap",
+              len(g) == 15 and all(x > 0 for x in g) and SNAP not in out, (len(g), SNAP in out))
+        check("incsearch/burst: marker never reaches terminal", b"nvim-glide" not in t.log)
+    finally:
+        t.close()
+
+
 def main():
     path = sample()
     t = Term([path])
@@ -588,6 +690,7 @@ def main():
         t.close()
 
     floats()
+    wrapped_and_modes()
 
     print("%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)

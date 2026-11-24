@@ -75,6 +75,7 @@
 #include "nvim/digraph.h"
 #include "nvim/drawline.h"
 #include "nvim/drawscreen.h"
+#include "nvim/eval/typval.h"
 #include "nvim/eval/vars.h"
 #include "nvim/ex_getln.h"
 #include "nvim/fold.h"
@@ -1647,28 +1648,50 @@ static void win_update(win_T *wp)
   // 2: wp->w_topline is below wp->w_lines[0].wl_lnum: may scroll up
   // 3: wp->w_topline is wp->w_lines[0].wl_lnum: find first entry in
   //    w_lines[] that needs updating.
+  bool did_view_scroll = false;
+  const int old_skip = skipcol_plines(wp, wp->w_old_skipcol);
+  const int new_skip = skipcol_plines(wp, wp->w_skipcol);
+  const bool geom_same = wp->w_old_topline > 0
+                         && wp->w_old_buffer == wp->w_buffer
+                         && wp->w_old_winrow == wp->w_winrow
+                         && wp->w_old_wincol == wp->w_wincol
+                         && wp->w_old_view_width == wp->w_view_width
+                         && wp->w_old_view_height == wp->w_view_height;
+  const bool view_changed = wp->w_old_topline > 0
+                            && (!geom_same
+                                || wp->w_topline != wp->w_old_topline
+                                || wp->w_topfill != wp->w_old_topfill
+                                || wp->w_skipcol != wp->w_old_skipcol
+                                || wp->w_leftcol != wp->w_old_leftcol);
+
   if ((type == UPD_VALID || type == UPD_SOME_VALID
        || type == UPD_INVERTED || type == UPD_INVERTED_ALL)
       && !wp->w_botfill && !wp->w_old_botfill) {
     if (mod_top != 0
         && wp->w_topline == mod_top
         && (!wp->w_lines[0].wl_valid
-            || topline_conceal == wp->w_lines[0].wl_lnum)) {
+            || (topline_conceal == wp->w_lines[0].wl_lnum
+                && wp->w_topfill == wp->w_old_topfill
+                && new_skip == old_skip))) {
       // w_topline is the first changed line and window is not scrolled,
       // the scrolling from changed lines will be done further down.
     } else if (wp->w_lines[0].wl_valid
                && (topline_conceal < wp->w_lines[0].wl_lnum
                    || (topline_conceal == wp->w_lines[0].wl_lnum
-                       && wp->w_topfill > wp->w_old_topfill))) {
+                       && (wp->w_topfill > wp->w_old_topfill
+                           || (wp->w_topfill == wp->w_old_topfill
+                               && new_skip < old_skip))))) {
       // New topline is above old topline: May scroll down.
       int j;
-      if (win_lines_concealed(wp)) {
+      if (topline_conceal == wp->w_lines[0].wl_lnum) {
+        j = 0;
+      } else if (win_lines_concealed(wp)) {
         // Count the number of lines we are off, counting a sequence
         // of folded lines as one, and skip concealed lines.
         j = 0;
         for (linenr_T ln = wp->w_topline; ln < wp->w_lines[0].wl_lnum; ln++) {
           j += !decor_conceal_line(wp, ln - 1, false);
-          if (j >= wp->w_view_height - 1) {
+          if (j >= wp->w_view_height) {
             break;
           }
           hasFolding(wp, ln, NULL, &ln);
@@ -1676,19 +1699,27 @@ static void win_update(win_T *wp)
       } else {
         j = wp->w_lines[0].wl_lnum - wp->w_topline;
       }
-      // Scroll when at least one row stays: a page back (CTRL-B, h-2 rows)
-      // scrolls like a page forward does, which a terminal can animate.
-      if (j < wp->w_view_height - 1) {               // not too far off
-        int i = plines_m_win(wp, wp->w_topline, wp->w_lines[0].wl_lnum - 1, wp->w_view_height);
-        // insert extra lines for previously invisible filler lines
-        if (wp->w_lines[0].wl_lnum != wp->w_topline) {
-          i += win_get_fill(wp, wp->w_lines[0].wl_lnum) - wp->w_old_topfill;
+      // Scroll whenever at least one row stays on screen.
+      if (j < wp->w_view_height) {                    // not too far off
+        int i;
+        if (topline_conceal == wp->w_lines[0].wl_lnum) {
+          i = (wp->w_topfill - wp->w_old_topfill) + (old_skip - new_skip);
+        } else {
+          i = plines_m_win(wp, wp->w_topline, wp->w_lines[0].wl_lnum - 1,
+                           wp->w_view_height + new_skip);
+          i -= new_skip;
+          // insert extra lines for previously invisible filler / skipped lines
+          i += win_get_fill(wp, wp->w_lines[0].wl_lnum) - wp->w_old_topfill + old_skip;
         }
-        if (i != 0 && i < wp->w_view_height - 1) {  // less than a screen off
+        if (i > 0 && i < wp->w_view_height) {         // less than a screen off
           // Try to insert the correct number of lines.
           // If not the last window, delete the lines at the bottom.
           // win_ins_lines may fail when the terminal can't do it.
-          win_scroll_lines(wp, 0, i);
+          if (geom_same) {
+            did_view_scroll = win_scroll_lines_glide(wp, 0, i);
+          } else {
+            win_scroll_lines(wp, 0, i);
+          }
           bot_scroll_start = 0;
           if (wp->w_lines_valid != 0) {
             // Need to update rows that are new, stop at the
@@ -1698,15 +1729,17 @@ static void win_update(win_T *wp)
 
             // Move the entries that were scrolled, disable
             // the entries for the lines to be redrawn.
-            if ((wp->w_lines_valid += (linenr_T)j) > wp->w_view_height) {
-              wp->w_lines_valid = wp->w_view_height;
-            }
-            int idx;
-            for (idx = wp->w_lines_valid; idx - j >= 0; idx--) {
-              wp->w_lines[idx] = wp->w_lines[idx - j];
-            }
-            while (idx >= 0) {
-              wp->w_lines[idx--].wl_valid = false;
+            if (j > 0) {
+              if ((wp->w_lines_valid += (linenr_T)j) > wp->w_view_height) {
+                wp->w_lines_valid = wp->w_view_height;
+              }
+              int idx;
+              for (idx = wp->w_lines_valid; idx - j >= 0; idx--) {
+                wp->w_lines[idx] = wp->w_lines[idx - j];
+              }
+              while (idx >= 0) {
+                wp->w_lines[idx--].wl_valid = false;
+              }
             }
           }
         } else {
@@ -1720,69 +1753,88 @@ static void win_update(win_T *wp)
       // When topline didn't change, find first entry in w_lines[] that
       // needs updating.
 
-      // try to find wp->w_topline in wp->w_lines[].wl_lnum
+      // try to find topline_conceal in wp->w_lines[].wl_lnum
       int j = -1;
       int row = 0;
       for (int i = 0; i < wp->w_lines_valid; i++) {
         if (wp->w_lines[i].wl_valid
-            && wp->w_lines[i].wl_lnum == wp->w_topline) {
+            && wp->w_lines[i].wl_lnum == topline_conceal) {
           j = i;
           break;
         }
         row += wp->w_lines[i].wl_size;
       }
       if (j == -1) {
-        // if wp->w_topline is not in wp->w_lines[].wl_lnum redraw all
+        // if topline_conceal is not in wp->w_lines[].wl_lnum redraw all
         // lines
         mid_start = 0;
       } else {
         // Try to delete the correct number of lines.
-        // wp->w_topline is at wp->w_lines[i].wl_lnum.
-
-        // If the topline didn't change, delete old filler lines,
-        // otherwise delete filler lines of the new topline...
-        if (wp->w_lines[0].wl_lnum == wp->w_topline) {
-          row += wp->w_old_topfill;
+        // topline_conceal is at wp->w_lines[j].wl_lnum.
+        int top_delta;
+        if (wp->w_lines[0].wl_lnum == topline_conceal) {
+          top_delta = (wp->w_old_topfill - wp->w_topfill) + (new_skip - old_skip);
         } else {
-          row += win_get_fill(wp, wp->w_topline);
+          top_delta = (win_get_fill(wp, wp->w_topline) - wp->w_topfill) + new_skip;
         }
-        // ... but don't delete new filler lines.
-        row -= wp->w_topfill;
-        if (row > 0) {
-          win_scroll_lines(wp, 0, -row);
-          bot_start = wp->w_view_height - row;
-          bot_scroll_start = bot_start;
-        }
-        if ((row == 0 || bot_start < 999) && wp->w_lines_valid != 0) {
-          // Skip the lines (below the deleted lines) that are still
-          // valid and don't need redrawing.    Copy their info
-          // upwards, to compensate for the deleted lines.  Set
-          // bot_start to the first row that needs redrawing.
-          bot_start = 0;
-          int idx = 0;
-          while (true) {
-            wp->w_lines[idx] = wp->w_lines[j];
-            // stop at line that didn't fit, unless it is still
-            // valid (no lines deleted)
-            if (row > 0 && bot_start + row
-                + (int)wp->w_lines[j].wl_size > wp->w_view_height) {
-              wp->w_lines_valid = idx + 1;
-              break;
+        row += top_delta;
+        if (row < 0 || row >= wp->w_view_height) {
+          mid_start = 0;
+        } else {
+          if (row > 0) {
+            if (geom_same) {
+              did_view_scroll = win_scroll_lines_glide(wp, 0, -row);
+            } else {
+              win_scroll_lines(wp, 0, -row);
             }
-            bot_start += wp->w_lines[idx++].wl_size;
+            bot_start = wp->w_view_height - row;
+            bot_scroll_start = bot_start;
+          }
+          if ((row == 0 || bot_start < 999) && wp->w_lines_valid != 0) {
+            // Skip the lines (below the deleted lines) that are still
+            // valid and don't need redrawing.    Copy their info
+            // upwards, to compensate for the deleted lines.  Set
+            // bot_start to the first row that needs redrawing.
+            bot_start = 0;
+            int idx = 0;
+            while (true) {
+              wp->w_lines[idx] = wp->w_lines[j];
+              int size = (int)wp->w_lines[idx].wl_size;
+              if (idx == 0 && top_delta > 0) {
+                size -= top_delta;
+                if (size <= 0) {
+                  wp->w_lines_valid = 0;
+                  break;
+                }
+                wp->w_lines[0].wl_size = (uint16_t)size;
+              }
+              // stop at line that didn't fit, unless it is still
+              // valid (no lines deleted)
+              if (row > 0 && bot_start + row + size > wp->w_view_height) {
+                wp->w_lines_valid = idx + 1;
+                break;
+              }
+              bot_start += size;
+              idx++;
 
-            // stop at the last valid entry in w_lines[].wl_size
-            if (++j >= wp->w_lines_valid) {
-              wp->w_lines_valid = idx;
-              break;
+              // stop at the last valid entry in w_lines[].wl_size
+              if (++j >= wp->w_lines_valid) {
+                wp->w_lines_valid = idx;
+                break;
+              }
+            }
+
+            // Correct the first entry for filler lines at the top
+            // when it won't get updated below.
+            if (win_may_fill(wp) && bot_start > 0) {
+              wp->w_lines[0].wl_size
+                = (uint16_t)plines_correct_topline(wp, wp->w_topline, NULL, true, NULL);
             }
           }
-
-          // Correct the first entry for filler lines at the top
-          // when it won't get updated below.
-          if (win_may_fill(wp) && bot_start > 0) {
-            wp->w_lines[0].wl_size
-              = (uint16_t)plines_correct_topline(wp, wp->w_topline, NULL, true, NULL);
+          if (row > 0 && new_skip > 0) {
+            // Redraw the partially scrolled topline so its '<<<' marker and
+            // wl_size are updated.
+            top_end = MAX(top_end, 1);
           }
         }
       }
@@ -1796,6 +1848,10 @@ static void win_update(win_T *wp)
     // Not UPD_VALID or UPD_INVERTED: redraw all lines.
     mid_start = 0;
     mid_end = wp->w_view_height;
+  }
+
+  if (view_changed && !did_view_scroll) {
+    win_glide_snap(wp);
   }
 
   if (type == UPD_SOME_VALID) {
@@ -2424,8 +2480,16 @@ redr_statuscol:
 
   // Reset the type of redrawing required, the window has been updated.
   wp->w_redr_type = 0;
+  wp->w_old_topline = wp->w_topline;
   wp->w_old_topfill = wp->w_topfill;
   wp->w_old_botfill = wp->w_botfill;
+  wp->w_old_leftcol = wp->w_leftcol;
+  wp->w_old_skipcol = wp->w_skipcol;
+  wp->w_old_buffer = wp->w_buffer;
+  wp->w_old_winrow = wp->w_winrow;
+  wp->w_old_wincol = wp->w_wincol;
+  wp->w_old_view_width = wp->w_view_width;
+  wp->w_old_view_height = wp->w_view_height;
 
   // Send win_extmarks if needed
   for (size_t n = 0; n < kv_size(win_extmark_arr); n++) {
@@ -2473,6 +2537,101 @@ redr_statuscol:
   if (!got_int) {
     got_int = save_got_int;
   }
+}
+
+static bool glide_maybe_active = false;
+static int glide_last_top = 0;
+static int glide_last_bot = 0;
+static int glide_last_left = 0;
+static int glide_last_right = 0;
+
+static bool win_can_glide(win_T *wp)
+{
+  if (wp->w_floating) {
+    return false;
+  }
+  if (wp->w_buffer != NULL && wp->w_buffer->b_p_ft != NULL
+      && strequal(wp->w_buffer->b_p_ft, "yeyito-sidebar")) {
+    dictitem_T *di = find_var_in_ht(get_globvar_ht(), 0,
+                                    S_LEN("yeyito_sidebar_smooth_scroll"), true);
+    if (di == NULL || !tv_get_bool(&di->di_tv)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void win_glide_snap(win_T *wp)
+{
+  if (!glide_maybe_active || !redrawing() || wp->w_floating) {
+    return;
+  }
+  int col = 0;
+  int row_off = 0;
+  ScreenGrid *grid = grid_adjust(&wp->w_grid, &row_off, &col);
+  int checked_width = MIN(grid->cols - col, wp->w_view_width);
+  int checked_height = MIN(grid->rows - row_off, wp->w_view_height);
+  if (checked_width <= 0 || checked_height <= 0) {
+    return;
+  }
+  int top = row_off + grid->comp_row;
+  int bot = top + checked_height;
+  int left = col + grid->comp_col;
+  int right = left + checked_width;
+  if (top >= glide_last_bot || bot <= glide_last_top
+      || left >= glide_last_right || right <= glide_last_left) {
+    return;
+  }
+  char mark[64];
+  int len = snprintf(mark, sizeof(mark), "\x1b_nvim-glide-snap;%d;%d;%d;%d\x1b\\",
+                     top, bot, left, right);
+  if (len > 0 && (size_t)len < sizeof(mark)) {
+    ui_call_ui_send((String){ .data = mark, .size = (size_t)len });
+    glide_maybe_active = false;
+  }
+}
+
+/// Scroll `line_count` lines at `row` in window `wp` for a view scroll,
+/// marking the region for TUI smooth scrolling before the grid_scroll event.
+///
+/// @return  true if a region scroll was performed.
+bool win_scroll_lines_glide(win_T *wp, int row, int line_count)
+{
+  if (!redrawing() || line_count == 0) {
+    return false;
+  }
+
+  int col = 0;
+  int row_off = 0;
+  ScreenGrid *grid = grid_adjust(&wp->w_grid, &row_off, &col);
+
+  int checked_width = MIN(grid->cols - col, wp->w_view_width);
+  int checked_height = MIN(grid->rows - row_off, wp->w_view_height);
+
+  if (row + abs(line_count) >= checked_height) {
+    return false;
+  }
+
+  if (row == 0 && win_can_glide(wp)) {
+    int top = row_off + grid->comp_row;
+    int bot = top + checked_height;
+    int left = col + grid->comp_col;
+    int right = left + checked_width;
+    char mark[64];
+    int len = snprintf(mark, sizeof(mark), "\x1b_nvim-glide;%d;%d;%d;%d\x1b\\",
+                       top, bot, left, right);
+    if (len > 0 && (size_t)len < sizeof(mark)) {
+      ui_call_ui_send((String){ .data = mark, .size = (size_t)len });
+      glide_maybe_active = true;
+      glide_last_top = top;
+      glide_last_bot = bot;
+      glide_last_left = left;
+      glide_last_right = right;
+    }
+  }
+
+  win_scroll_lines(wp, row, line_count);
+  return true;
 }
 
 /// Scroll `line_count` lines at 'row' in window 'wp'.

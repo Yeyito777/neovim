@@ -57,20 +57,26 @@ typedef struct {
 
 #include "move.c.generated.h"
 
-/// Get the number of screen lines skipped with "wp->w_skipcol".
-static int adjust_plines_for_skipcol(win_T *wp)
+/// Get the number of screen lines skipped for a given `skipcol`.
+int skipcol_plines(win_T *wp, colnr_T skipcol)
 {
-  if (wp->w_skipcol == 0) {
+  if (skipcol == 0 || !wp->w_p_wrap) {
     return 0;
   }
 
   int width = wp->w_view_width - win_col_off(wp);
   int w2 = width + win_col_off2(wp);
-  if (wp->w_skipcol >= width && w2 > 0) {
-    return (wp->w_skipcol - width) / w2 + 1;
+  if (skipcol >= width && w2 > 0) {
+    return (skipcol - width) / w2 + 1;
   }
 
   return 0;
+}
+
+/// Get the number of screen lines skipped with "wp->w_skipcol".
+static int adjust_plines_for_skipcol(win_T *wp)
+{
+  return skipcol_plines(wp, wp->w_skipcol);
 }
 
 /// Return how many lines "lnum" will take on the screen, taking into account
@@ -1022,8 +1028,10 @@ void curs_columns(win_T *wp, int may_scroll)
     extra = (prev_skipcol - wp->w_skipcol) / width2;
     // TODO(bfredl): this is very suspicious when not called by win_update()
     // We should not randomly alter screen state outside of update_screen() :(
-    if (wp->w_grid.target) {
-      win_scroll_lines(wp, 0, extra);
+    if (wp->w_grid.target && extra != 0) {
+      if (win_scroll_lines_glide(wp, 0, extra)) {
+        wp->w_old_skipcol = wp->w_skipcol;
+      }
     }
   } else if (!wp->w_p_sms) {
     wp->w_skipcol = 0;
@@ -1364,7 +1372,7 @@ bool scrolldown(win_T *wp, linenr_T line_count, int byfold)
       } else {
         wp->w_skipcol -= width1;
       }
-      redraw_later(wp, UPD_NOT_VALID);
+      redraw_later(wp, UPD_VALID);
       done++;
     } else if (can_fill) {
       wp->w_topfill++;
@@ -1391,7 +1399,7 @@ bool scrolldown(win_T *wp, linenr_T line_count, int byfold)
           if (size > width1) {
             wp->w_skipcol = width1;
             size -= width1;
-            redraw_later(wp, UPD_NOT_VALID);
+            redraw_later(wp, UPD_VALID);
           }
           while (size > width2) {
             wp->w_skipcol += width2;
@@ -1521,9 +1529,8 @@ bool scrollup(win_T *wp, linenr_T line_count, bool byfold)
     }
 
     if (prev_skipcol > 0 || wp->w_skipcol > 0) {
-      // need to redraw more, because wl_size of the (new) topline may
-      // now be invalid
-      redraw_later(wp, UPD_NOT_VALID);
+      // win_update() scrolls for w_old_skipcol -> w_skipcol and redraws topline.
+      redraw_later(wp, UPD_VALID);
     }
   } else {
     wp->w_topline += line_count;
@@ -1592,7 +1599,7 @@ void adjust_skipcol(void)
   }
   if (scrolled) {
     validate_virtcol(curwin);
-    redraw_later(curwin, UPD_NOT_VALID);
+    redraw_later(curwin, UPD_VALID);
     return;  // don't scroll in the other direction now
   }
   int row = 0;
@@ -1623,7 +1630,7 @@ void adjust_skipcol(void)
     if (row >= curwin->w_view_height) {
       curwin->w_skipcol += (row - curwin->w_view_height) * width2;
     }
-    redraw_later(curwin, UPD_NOT_VALID);
+    redraw_later(curwin, UPD_VALID);
   }
 }
 
@@ -1963,7 +1970,7 @@ void scroll_cursor_bot(win_T *wp, int min_scroll, bool set_topbot)
         || wp->w_skipcol != 0) {
       wp->w_valid &= ~(VALID_WROW|VALID_CROW);
       if (wp->w_skipcol != old_skipcol) {
-        redraw_later(wp, UPD_NOT_VALID);
+        redraw_later(wp, UPD_VALID);
       } else {
         reset_skipcol(wp);
       }
@@ -2253,7 +2260,7 @@ void scroll_cursor_halfway(win_T *wp, bool atend, bool prefer_above)
     wp->w_topline = topline;
     if (skipcol != 0) {
       wp->w_skipcol = skipcol;
-      redraw_later(wp, UPD_NOT_VALID);
+      redraw_later(wp, UPD_VALID);
     } else if (do_sms) {
       reset_skipcol(wp);
     }

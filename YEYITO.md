@@ -168,15 +168,18 @@ because of an edit (`dd`, `o`, a paste), and jumps further than a screen
 its rows scroll across the whole width and the other windows' columns are
 drawn again in the same frame.
 
-How: `smoothscroll.lua` sends the TUI a marker (`nvim_ui_send`, never written
-to the terminal) from `WinScrolled`, which fires just before the redraw. The
-TUI then glides the region scroll of that window's text area: after the
-scroll, in the same synchronized update, it declares the window as st's moving
-rectangle (`OSC 2032 ; r`) and starts an easing term (`OSC 2032 ; m ; 0 ; ROWS*1000
-; 100`). st draws the strip the shifted window uncovers from the lines its
-scroll pushed out. A window that moved without a region scroll (it was
-redrawn) stops any glide (`OSC 2032 ; o ; 0`). Other terminals, tmux and
-`nvim --clean` are unaffected.
+How: `win_update()` in `src/nvim/drawscreen.c` marks view scrolls directly right
+before emitting `grid_scroll` (`\x1b_nvim-glide;...`, never written to the
+terminal), including wrapped-line / `w_skipcol` scrolls, visual mode and
+`incsearch`. The TUI then glides the region scroll of that window's text area:
+after the scroll, in the same synchronized update, it declares the window as
+st's moving rectangle (`OSC 2032 ; r`) and starts an easing term (`OSC 2032 ; m`
+over 100 ms; consecutive scrolls that would exceed the terminal's kept rows
+clamp cleanly instead of snapping). st draws the strip the shifted window
+uncovers from the lines its scroll pushed out. A window whose view moved without
+a region scroll (a jump further than a screen, buffer switch, horizontal scroll)
+stops any overlapping glide (`OSC 2032 ; o ; 0`). Other terminals and tmux are
+unaffected.
 
 A float over the window (the AI's reply card, say) stays put and the text
 glides around it, as Exocortex's history does around its Tasks panel: the

@@ -60,11 +60,15 @@
    && 0 == memcmp((str), (prefix), sizeof(prefix) - 1))
 #define TMUX_WRAP(is_tmux, seq) \
   ((is_tmux) ? "\x1bPtmux;\x1b" seq "\x1b\\" : seq)
-/// Marker the server sends with nvim_ui_send() before the redraw in which a
-/// window's view scrolled: "\x1b_nvim-glide;TOP;BOT;LEFT;RIGHT\x1b\\" with
-/// the window text area in screen cells (BOT and RIGHT exclusive, like
-/// grid_scroll). It is consumed here, never written to the terminal.
+/// Marker the server sends with ui_call_ui_send() right before a view scroll:
+/// "\x1b_nvim-glide;TOP;BOT;LEFT;RIGHT\x1b\\" with the window text area in
+/// screen cells (BOT and RIGHT exclusive, like grid_scroll). Consumed here,
+/// never written to the terminal.
 #define GLIDE_MARK "\x1b_nvim-glide;"
+/// Sent when a window's view or geometry changed without a region scroll
+/// (e.g. a jump further than a screen, buffer switch, horizontal scroll, split):
+/// "\x1b_nvim-glide-snap;TOP;BOT;LEFT;RIGHT\x1b\\". Stops any overlapping glide.
+#define GLIDE_SNAP_MARK "\x1b_nvim-glide-snap;"
 /// The compositor sends this just before a region scroll with floats over it:
 /// "\x1b_nvim-glide-over;TOP,BOT,LEFT,RIGHT;...\x1b\\", the cells of each float
 /// over the region (BOT and RIGHT exclusive). They stay put; the rest moves.
@@ -1584,6 +1588,28 @@ static bool glide_arm(TUIData *tui, String content)
     return true;
   }
 
+  size_t snaplen = sizeof(GLIDE_SNAP_MARK) - 1;
+  if (content.size > snaplen && memcmp(content.data, GLIDE_SNAP_MARK, snaplen) == 0) {
+    if (tui->glide.on && tui->glide.nterms > 0) {
+      char buf[64];
+      size_t len = MIN(content.size - snaplen, sizeof(buf) - 1);
+      memcpy(buf, content.data + snaplen, len);
+      buf[len] = NUL;
+      Rect r;
+      if (sscanf(buf, "%d;%d;%d;%d", &r.top, &r.bot, &r.left, &r.right) == 4) {
+        // r.bot and r.right are exclusive; tui->glide.rect is inclusive.
+        Rect g = tui->glide.rect;
+        if (g.top < 0
+            || (r.top <= g.bot && r.bot > g.top && r.left <= g.right && r.right > g.left)) {
+          glide_snap(tui);
+        }
+      } else {
+        glide_snap(tui);
+      }
+    }
+    return true;
+  }
+
   size_t marklen = sizeof(GLIDE_MARK) - 1;
   if (content.size <= marklen || memcmp(content.data, GLIDE_MARK, marklen) != 0) {
     return false;
@@ -1705,10 +1731,23 @@ static void glide_start(TUIData *tui, int top, int bot, int left, int right, int
     tui->glide.nmoving = nmoving;
   }
   int height = bot - top + 1;
-  double offset = remaining + rows;
-  if ((offset < 0 ? -offset : offset) >= MAX(1, height - 1)) {
-    // Further than the lines the terminal keeps for the region: jump.
+  if (height <= 1) {
     glide_snap(tui);
+    return;
+  }
+  int max_off = height - 1;
+  double offset = remaining + rows;
+  if ((offset < 0 ? -offset : offset) > max_off) {
+    // Clamp to the lines the terminal keeps for the region rather than
+    // snapping to 0 mid-scroll. Set a non-zero base first so st drops old
+    // easing terms without freeing its kept lines, then move base back to 0
+    // with a single fresh easing term.
+    int target = offset > 0 ? max_off : -max_off;
+    int t = target * 1000;
+    out_printf(tui, 96, "\x1b]2032;o;%d\x1b\\\x1b]2032;m;%d;%d;%d\x1b\\", t, -t, t, GLIDE_MS);
+    tui->glide.term[0].start = glide_now_ms();
+    tui->glide.term[0].rows = target;
+    tui->glide.nterms = 1;
     return;
   }
   out_printf(tui, 64, "\x1b]2032;m;0;%d;%d\x1b\\", rows * 1000, GLIDE_MS);

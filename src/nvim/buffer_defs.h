@@ -1159,6 +1159,7 @@ struct window_S {
   // displaying the buffer.
   linenr_T w_topline;               // buffer line number of the line at the
                                     // top of the window
+  linenr_T w_old_topline;           // w_topline at last redraw (0 before first)
   char w_topline_was_set;           // flag set to true when topline is set,
                                     // e.g. by winrestview()
   int w_topfill;                    // number of filler lines above w_topline
@@ -1169,9 +1170,16 @@ struct window_S {
   colnr_T w_leftcol;                // screen column number of the left most
                                     // character in the window; used when
                                     // 'wrap' is off
+  colnr_T w_old_leftcol;            // w_leftcol at last redraw
   colnr_T w_skipcol;                // starting screen column for the first
                                     // line in the window; used when 'wrap' is
                                     // on; does not include win_col_off()
+  colnr_T w_old_skipcol;            // w_skipcol at last redraw
+  buf_T *w_old_buffer;              // w_buffer at last redraw
+  int w_old_winrow;                 // w_winrow at last redraw
+  int w_old_wincol;                 // w_wincol at last redraw
+  int w_old_view_width;             // w_view_width at last redraw
+  int w_old_view_height;            // w_view_height at last redraw
 
   // six fields that are only used when there is a WinScrolled autocommand
   linenr_T w_last_topline;          ///< last known value for w_topline
