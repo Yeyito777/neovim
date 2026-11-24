@@ -70,7 +70,7 @@
 /// over the region (BOT and RIGHT exclusive). They stay put; the rest moves.
 #define GLIDE_OVER_MARK "\x1b_nvim-glide-over;"
 #define GLIDE_MS 100      ///< glide duration, st's own smoothscroll_ms feel
-#define GLIDE_MAXARMS 4
+#define GLIDE_MAXARMS 16
 #define GLIDE_MAXTERMS 16
 #define GLIDE_MAXOVER 4   ///< kMaxOver in ui_compositor.c
 #define GLIDE_MAXRECTS 8  ///< moving rectangles st takes
@@ -1602,15 +1602,25 @@ static bool glide_arm(TUIData *tui, String content)
 }
 
 /// The marked window whose text area is exactly this scroll region, or -1.
+/// Several redraws can reach the terminal in one frame (inputs coming fast,
+/// a trackpad), each marking the same window, so a mark no scroll has drawn
+/// yet comes first: else the next ones stay unmatched and glide_end_frame()
+/// stops the glide.
 static int glide_match(TUIData *tui, int top, int bot, int left, int right)
 {
+  int found = -1;
   for (int i = 0; i < tui->glide.narmed; i++) {
     Rect r = tui->glide.armed[i];
     if (r.top == top && r.bot == bot && r.left == left && r.right == right) {
-      return i;
+      if (!tui->glide.consumed[i]) {
+        return i;
+      }
+      if (found < 0) {
+        found = i;
+      }
     }
   }
-  return -1;
+  return found;
 }
 
 /// What moves of `region` (inclusive): all of it but the floats over it, the way

@@ -515,6 +515,13 @@ def main():
         check("CTRL-F glides a page", glides(t.keys(b"\x06")) == [(WIN_H - 2) * 1000])
         check("CTRL-B glides a page back", glides(t.keys(b"\x02")) == [-(WIN_H - 2) * 1000])
         check("wheel glides", glides(t.keys(b"\x1b[<65;10;10M")) == [3000])
+        # Fast wheel or trackpad input: several redraws reach the terminal in
+        # one frame, each marking the window. Every scroll glides and nothing
+        # stops the glide at the end of the frame.
+        for data, want in ((b"\x1b[<65;10;10M" * 2, [3000, 3000]), (b"\x1b[<64;10;10M" * 3, [-3000] * 3)):
+            out = t.keys(data)
+            got = [(glides(f), SNAP in f) for f in frames(out)]
+            check("wheel ticks in one frame all glide, no snap", got == [(want, False)], got)
         check("j at the bottom edge glides", glides(t.keys(b"L") + t.keys(b"j")) == [1000])
         got = glides(t.keys(b"H") + t.keys(b"J"))
         check("J inside the view doesn't glide", got == [], got)
