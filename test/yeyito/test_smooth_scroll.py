@@ -398,6 +398,10 @@ def floats():
         scrolled = [f for f in frames(out) if b"\x1b[M" in f]
         check("card: the scroll, the glide and the card are one frame", len(scrolled) == 1
               and GLIDE.search(scrolled[0]) is not None and "┌".encode() in scrolled[0], [len(f) for f in frames(out)])
+        r_pos = RECT_LIST.search(scrolled[0]).start() if scrolled and RECT_LIST.search(scrolled[0]) else -1
+        m_pos = scrolled[0].find(b"\x1b[M") if scrolled else -1
+        check("card: rectangles declared before the region scroll so st keeps interior-edge lines",
+              0 <= r_pos < m_pos, (r_pos, m_pos))
         check("card: not a repaint of the text", out.count(b"word") < 30, out.count(b"word"))
         check("card: drawn back in that frame, same screen", same_screen() == [], same_screen())
         out = t.keys(b"\x19", idle=0.15)
@@ -642,6 +646,9 @@ def main():
               repr(out[-300:]))
         out = t.keys(b"gg")
         check("gg (far jump) does not glide", glides(out) == [])
+        out = t.keys(b"\x05", idle=0.0) + t.keys(b"dd")
+        check("dd mid-glide snaps", SNAP in out, repr(out[-300:]))
+        t.keys(b"ugg", idle=0.2)
 
         out = t.keys(b":vsplit\r")
         out = t.keys(b"gg\x05")

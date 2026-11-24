@@ -74,7 +74,7 @@
 /// over the region (BOT and RIGHT exclusive). They stay put; the rest moves.
 #define GLIDE_OVER_MARK "\x1b_nvim-glide-over;"
 #define GLIDE_MS 100      ///< glide duration, st's own smoothscroll_ms feel
-#define GLIDE_MAXARMS 16
+#define GLIDE_MAXARMS 64
 #define GLIDE_MAXTERMS 16
 #define GLIDE_MAXOVER 4   ///< kMaxOver in ui_compositor.c
 #define GLIDE_MAXRECTS 8  ///< moving rectangles st takes
@@ -1698,17 +1698,17 @@ static int glide_moving_rects(TUIData *tui, Rect region, Rect *rects)
   return n;
 }
 
-/// After a region scroll (rows > 0: content moved up) of a marked window:
-/// draw its content where it was and let the terminal ease it into place.
-/// Rows and columns are inclusive here.
-static void glide_start(TUIData *tui, int top, int bot, int left, int right, int rows)
+/// Before a region scroll of a marked window: declare the moving rectangles
+/// (excluding any floats over the region) so the terminal knows every rectangle
+/// edge before capturing departing lines. Rows and columns are inclusive here.
+///
+/// @return  true if the scroll can glide.
+static bool glide_prepare(TUIData *tui, int top, int bot, int left, int right)
 {
-  double remaining = glide_remaining(tui);
   Rect rect = { top, bot, left, right };
   if (memcmp(&rect, &tui->glide.rect, sizeof rect) != 0) {
     // Another window: the terminal kept lines for this region only.
     glide_snap(tui);
-    remaining = 0;
     tui->glide.rect = rect;
     tui->glide.nmoving = 0;
   }
@@ -1717,7 +1717,7 @@ static void glide_start(TUIData *tui, int top, int bot, int left, int right, int
   if (nmoving <= 0) {
     // Floats over all of it, or too many to go around.
     glide_snap(tui);
-    return;
+    return false;
   }
   if (nmoving != tui->glide.nmoving
       || memcmp(moving, tui->glide.moving, (size_t)nmoving * sizeof(Rect)) != 0) {
@@ -1730,6 +1730,14 @@ static void glide_start(TUIData *tui, int top, int bot, int left, int right, int
     memcpy(tui->glide.moving, moving, (size_t)nmoving * sizeof(Rect));
     tui->glide.nmoving = nmoving;
   }
+  return true;
+}
+
+/// After a region scroll (rows > 0: content moved up) of a prepared window:
+/// draw its content where it was and let the terminal ease it into place.
+static void glide_move(TUIData *tui, int top, int bot, int rows)
+{
+  double remaining = glide_remaining(tui);
   int height = bot - top + 1;
   if (height <= 1) {
     glide_snap(tui);
@@ -1811,6 +1819,7 @@ void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, 
                                 && ((left == 0 && right == tui->width - 1) || has_lr_margins))));
 
   if (can_scroll) {
+    bool do_glide = armed >= 0 && glide_prepare(tui, top, bot, left, right);
     int scroll_left = band ? 0 : left;
     int scroll_right = band ? tui->width - 1 : right;
     // Change terminal scroll region and move cursor to the top
@@ -1851,10 +1860,12 @@ void tui_grid_scroll(TUIData *tui, Integer g, Integer startrow, Integer endrow, 
 
     if (armed >= 0) {
       tui->glide.consumed[armed] = true;
-      glide_start(tui, top, bot, left, right, (int)rows);
-    } else if (tui->glide.nterms > 0
-               && (top != tui->glide.rect.top || bot != tui->glide.rect.bot)) {
-      // The terminal keeps lines for one region; scrolling another drops them.
+      if (do_glide) {
+        glide_move(tui, top, bot, (int)rows);
+      }
+    } else if (tui->glide.nterms > 0) {
+      // Any unarmed region scroll (an edit like dd/o, or a non-gliding window)
+      // mutates the terminal's grid and kept lines without updating the glide.
       glide_snap(tui);
     }
   } else {

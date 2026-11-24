@@ -66,7 +66,7 @@ int skipcol_plines(win_T *wp, colnr_T skipcol)
 
   int width = wp->w_view_width - win_col_off(wp);
   int w2 = width + win_col_off2(wp);
-  if (skipcol >= width && w2 > 0) {
+  if (width > 0 && skipcol >= width && w2 > 0) {
     return (skipcol - width) / w2 + 1;
   }
 

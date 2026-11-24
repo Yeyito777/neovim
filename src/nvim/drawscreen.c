@@ -1850,7 +1850,11 @@ static void win_update(win_T *wp)
     mid_end = wp->w_view_height;
   }
 
-  if (view_changed && !did_view_scroll) {
+  if (wp->w_floating) {
+    if (!geom_same) {
+      win_glide_snap(wp);
+    }
+  } else if (view_changed && !did_view_scroll) {
     win_glide_snap(wp);
   }
 
@@ -2563,21 +2567,33 @@ static bool win_can_glide(win_T *wp)
 
 static void win_glide_snap(win_T *wp)
 {
-  if (!glide_maybe_active || !redrawing() || wp->w_floating) {
+  if (!glide_maybe_active || !redrawing()) {
     return;
   }
-  int col = 0;
-  int row_off = 0;
-  ScreenGrid *grid = grid_adjust(&wp->w_grid, &row_off, &col);
-  int checked_width = MIN(grid->cols - col, wp->w_view_width);
-  int checked_height = MIN(grid->rows - row_off, wp->w_view_height);
-  if (checked_width <= 0 || checked_height <= 0) {
+  int top, bot, left, right;
+  if (wp->w_floating) {
+    ScreenGrid *g = &wp->w_grid_alloc;
+    if (!g->chars || g->comp_disabled) {
+      return;
+    }
+    top = g->comp_row;
+    bot = top + MIN(g->rows, g->comp_height);
+    left = g->comp_col;
+    right = left + MIN(g->cols, g->comp_width);
+  } else {
+    int col = 0;
+    int row_off = 0;
+    ScreenGrid *grid = grid_adjust(&wp->w_grid, &row_off, &col);
+    int checked_width = MIN(grid->cols - col, wp->w_view_width);
+    int checked_height = MIN(grid->rows - row_off, wp->w_view_height);
+    top = row_off + grid->comp_row;
+    bot = top + checked_height;
+    left = col + grid->comp_col;
+    right = left + checked_width;
+  }
+  if (bot <= top || right <= left) {
     return;
   }
-  int top = row_off + grid->comp_row;
-  int bot = top + checked_height;
-  int left = col + grid->comp_col;
-  int right = left + checked_width;
   if (top >= glide_last_bot || bot <= glide_last_top
       || left >= glide_last_right || right <= glide_last_left) {
     return;

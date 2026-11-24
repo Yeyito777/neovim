@@ -674,13 +674,15 @@ static bool curgrid_covered_rect(int top, int bot, int left, int right)
   for (size_t i = curgrid->comp_index + 1; i < kv_size(layers); i++) {
     ScreenGrid *g = kv_A(layers, i);
     int g_top = g->comp_row;
-    int g_bot = g->comp_row + g->rows;
+    int g_bot = g->comp_row + MIN(g->rows, g->comp_height);
+    int g_left = g->comp_col;
+    int g_right = g->comp_col + MIN(g->cols, g->comp_width);
     if (g == &msg_grid) {
       // Only the rows messages are shown in, as curgrid_covered_above().
       g_top = msg_current_row - (msg_was_scrolled ? 1 : 0);
       g_bot = Rows;
     }
-    if (g_top < bot && g_bot > top && g->comp_col < right && g->comp_col + g->cols > left) {
+    if (!g->comp_disabled && g_top < bot && g_bot > top && g_left < right && g_right > left) {
       return true;
     }
   }
@@ -720,6 +722,11 @@ static bool scroll_under_grids(int top, int bot, int left, int right, int rows)
     over[nover].left = MAX(g_left, left);
     over[nover].right = MIN(g_right, right);
     nover++;
+  }
+
+  if (nover == 0) {
+    ui_composed_call_grid_scroll(1, top, bot, left, right, rows, 0);
+    return true;
   }
 
   char mark[32 + kMaxOver * 32];
